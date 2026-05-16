@@ -1,0 +1,291 @@
+---
+title: "本地跑 6 个 AI 角色 — 选 anet 的理由与边界"
+estimated_minutes: 18
+---
+
+# 本地跑 6 个 AI 角色 — 选 anet 的理由与边界
+
+> 一行 `npm install` 装完，30 秒内 6 个 AI 角色在你电脑上开辩论——无需注册账号，无需上云，数据全在本地 SQLite。
+
+## 0. 一句话先讲明白
+
+**anet（`@sleep2agi/agent-network`）是一个 npm 包，零 Python 依赖，本地优先，让多个 AI Agent 在你自己的机器上组网协作。**
+
+它做一件事：提供一个本地通信中枢（CommHub），让 Claude / GPT / DeepSeek / Kimi / GLM 等 Agent 互相派任务、报进度、协调分工——就像一个装在你电脑上的 AI 小团队。
+
+跟市面上三大多 Agent 框架（LangGraph / AutoGen / CrewAI）最大的区别：**那三个都是 Python 库，往云跑；anet 是 Node.js 包，往本地跑。**
+
+---
+
+## 你将学到
+
+- 多 Agent 框架的 3 类系统性痛点，以及 anet 怎么逐条应对
+- anet vs LangGraph / AutoGen / CrewAI 的关键维度对照
+- anet 三进程架构 30 秒理解（CommHub + Dashboard + Agent）
+- 八家 LLM Provider 一键切换原理，以及 tool_use 跨 Provider 兼容矩阵
+- 三种 Runtime 怎么选（claude-code-cli / claude-agent-sdk / codex-sdk）
+- 四个内置 Demo 是什么，装完一行命令能看到什么
+- anet 不适合哪些场景（诚实清单，避免你买完课后遗憾）
+
+## 适合谁
+
+适合已经用 Claude Code 跑过一些自动化任务、想把工作量分摊给多个 Agent 的工程师或内容创作者。如果你只有单任务需求，或者不会基本的命令行操作，先把单 Agent 工作流跑稳再来。
+
+---
+
+## 1. 多 Agent 框架的 3 类痛点
+
+在选工具之前，先看清楚你在逃离什么。当前主流的多 Agent 框架，有三类系统性问题。
+
+### 1.1 SaaS 锁定
+
+CrewAI 近年推出托管云平台。流程跑起来方便，但：
+
+- 数据上云：你的 Agent 对话、任务历史、API key 存在对方服务器
+- 计量计费：并发多一点，账单马上涨
+- 断网即停：本地网络不稳或对方平台抖动，你的任务直接挂掉
+
+anet 反例：CommHub 是一个跑在 `localhost:9200` 的本地服务，SQLite 数据库存在 `~/.commhub/commhub.db`，没有官方托管 Hub，也不打算做。Apache 2.0 开源，自部署。
+
+### 1.2 Python 重依赖
+
+LangGraph、AutoGen、CrewAI 全是 Python 生态。这意味着：
+
+- 非 Python 团队（前端 / Node.js 团队）要先搭 venv、装 CUDA、处理版本冲突
+- M1/M2 Mac 上部分依赖坑多（`grpcio`、`tokenizers` 等 native 编译库偶发失败）
+- 公司 IT 管控环境装 Python 包要走审批流
+
+anet 反例：
+
+```bash
+# Node.js >= 22.13.0，装一个包搞定
+npm install -g @sleep2agi/agent-network
+
+# 验证，实测输出：
+anet --version
+# anet v2.2.1
+```
+
+没有 Python。没有 venv。没有 pip。
+
+> **前置要求**：Node.js >= 22.13.0。低版本会触发 `EBADENGINE`（`EBADENGINE` = Node.js 引擎版本不满足包要求时抛出的错误）警告，`@inquirer/prompts` 等依赖要求此版本下限。
+
+### 1.3 默认 OpenAI / 单厂商
+
+AutoGen 早期主力绑 OpenAI，v0.4 后引入 multi-model 支持（2026 状态：跟 anet 一样支持 Anthropic 系，但 deployment story 仍偏 SaaS）。LangGraph 走 LangChain 生态，接多厂商需要写自定义 LLM wrapper。CrewAI 同理。结果：
+
+- 想用 Claude 要打补丁
+- 想用国产模型要二次开发
+- 模型成本优化（主力 Sonnet + 重活 DeepSeek + 长上下文 Kimi）在架构层面很难做到
+
+anet 反例：8 家 Provider，经 Docker E2E 验证，`ANTHROPIC_BASE_URL` 一行切换——第 4 节展开。
+
+---
+
+## 2. anet vs 其他多 Agent 框架
+
+下表按维度对照，不是 benchmark，只说明定位差异。数据按 2026-05 各项目公开文档整理。
+
+| 维度 | anet | LangGraph | AutoGen | CrewAI |
+|---|---|---|---|---|
+| 部署形态 | 一个 npm 包 | pip 库，自写 server | pip 库，自写 server | pip 库，可选云 |
+| 语言依赖 | Node.js >= 22 | Python | Python | Python |
+| 多 LLM 厂商 | 8 家开箱（见第 4 节）| 走 LangChain | 主要 OpenAI / Azure | 走 LangChain |
+| 编排风格 | Mesh（自由互派）| DAG（有向无环图）工作流 | 会话轮转 | 角色层级 |
+| 人 + Agent 同台 | Dashboard Chat 同一界面 | 无（纯程序）| 无 | 无 |
+
+几句直接的话：
+
+**部署**：LangGraph / AutoGen / CrewAI 你装完还要自己写一套 server 层才能"跑起来"；anet 装完三行命令就有 Hub、Dashboard 和 Agent，直接派活。
+
+**编排风格**：LangGraph 的 DAG（有向无环图）工作流适合流程固定、步骤明确的流水线（比如：解析文档 → 提取字段 → 入库），工程严密。anet 的 Mesh 风格适合团队协作类任务（辩论、分工、评审），Agent 自主决定找谁派活。这是两种不同的哲学，不是谁替代谁。
+
+---
+
+## 3. anet 架构 30 秒理解
+
+anet 跑起来是**三个进程，一个数据库**：
+
+```
+┌──────────┐   send_task   ┌────────────────┐   SSE push   ┌──────────┐
+│ Agent A  │ ────────────→ │ CommHub        │ ───────────→ │ Agent B  │
+│          │ ←──────────── │ Server (:9200) │ ←─────────── │          │
+└──────────┘     reply     └───────┬────────┘    report    └──────────┘
+                                   │
+                          ┌────────┴────────┐
+                          │ Dashboard       │
+                          │ (:3000)         │
+                          └─────────────────┘
+```
+
+两条传输：
+
+- **MCP Streamable HTTP**（`/mcp` 端点，MCP = Model Context Protocol，AI 工具调用标准）：Agent 主动调 Hub 的 17 个 MCP 工具，包括 `send_task`（派活）、`get_all_status`（看有谁在线）、`send_reply`（回复任务）等
+- **SSE 推送**（`/events/:alias`，SSE = Server-Sent Events，服务端实时推送协议）：Hub 主动把任务推给 Agent，Agent 连上就实时收推送
+
+一个数据库：
+
+- **SQLite** 在 `~/.commhub/commhub.db`，所有任务记录、消息、Agent 状态全在这里，不出你的机器
+
+节点上线流程（从 0 到就绪，实际 30 秒内完成）：
+
+```
+anet node create my-bot
+  → 选 runtime（claude-code-cli / claude-agent-sdk / codex-sdk）
+  → 选 provider（Anthropic / MiniMax / DeepSeek / ...）
+  → 填 API key
+  → 配置写入本地
+anet node start my-bot
+  → 启动进程，连接 CommHub
+  → "SSE connected" 出现，Agent 上线
+```
+
+第一次启动 Hub 时，`commhub-server` 会通过 `bunx`（推荐）/ `npx` 自动拉取——你只需要全局装过 `@sleep2agi/agent-network`，其余组件按需下载，不用手动管理。
+
+> **安全提示**：每个 Agent 节点默认以 `dangerouslySkipPermissions: true`（跳过工具调用权限确认弹窗的标志）运行，调工具不会跳确认弹窗。不要在 `$HOME` 直接跑；用一次性工作目录隔离。详见 SECURITY.md。
+
+---
+
+## 4. 八家 LLM Provider 一键切换
+
+anet 内置 8 家 LLM Provider，通过 `ANTHROPIC_BASE_URL` 一行切换（Anthropic / OpenAI / MiniMax / DeepSeek / GLM / Kimi / 书生 / OpenRouter）— 8 家在 anet Docker E2E 中验证。
+
+**详细配置 + 价格对照 + tool_use 兼容矩阵**：见 sister 课 [agentic-engineer · 多模型后端切换](../../agentic-engineer/01-mindset/02-multi-model-backends.mdx) 第 5 / 10 节。
+
+### 4.1 tool_use 跨 Provider 兼容矩阵
+
+多 Agent 场景特有的坑：tool_use / MCP 调用在不同 Provider 兼容性不均。anet Docker E2E 覆盖到 tool_use 行为的 Provider：
+
+| Provider | tool_use 稳定性 | 备注 |
+|---|---|---|
+| Anthropic | 原生，满分 | 基准 |
+| GLM / Kimi | 高，接近 Anthropic 兼容 | 多 Agent 场景首选第三方备选 |
+| DeepSeek | 中，偶发不调 tool 直接给文字答案 | 详见 [agentic-engineer · 多模型后端切换](../../agentic-engineer/01-mindset/02-multi-model-backends.mdx) 第 10 节 |
+| OpenAI（via CCR 协议翻译）| 中，需协议翻译层 | parallel_tool_calls 比 Anthropic 稳 |
+| 其他 | 偏低，跑得通但行为不稳定 | multi-agent 场景建议主力 stick Anthropic 兼容档 |
+
+工程师 60% 的 multi-agent debug 都在 tool_use 兼容性上——主力 Agent 用 Anthropic 兼容 Provider，重活转 DeepSeek/Kimi 等纯生成任务。
+
+---
+
+## 5. 三种 Runtime 怎么选
+
+anet 支持 3 种 Runtime 自由混搭（`claude-code-cli` / `claude-agent-sdk` / `codex-sdk`），同 Hub 上不同 Agent 可选不同 Runtime。
+
+**Runtime 详细对比 + 选型原则 + 各自踩坑历史**：见本课 CH 3 *Runtime 与 Provider 切换*。
+
+选择速查：
+
+- 已有 Claude Pro 订阅 → 用 `claude-code-cli`，边际成本接近零，工具链最完整
+- 需要国产模型 / 按量付费精确控成本 → 用 `claude-agent-sdk` + 对应 Provider
+- 团队里有人用 OpenAI 生态 → 用 `codex-sdk`，跟 OpenAI 账号直连
+
+> **实测状态（来自 README）**：`claude-agent-sdk` + 六家 Provider 有 Docker E2E 覆盖，最稳。`claude-code-cli` 能跑但未自动化回归（v0.8.2 修了 session resume 默认丢失 bug）。`codex-sdk` 单元测试通过，真实 OAuth 流程未上 CI。选主力 Agent 推荐先用 `claude-agent-sdk`。
+
+---
+
+## 6. 四个内置 Demo，装完就能跑
+
+anet 内置四个 Demo，每个都在独立 network 里跑完自动清场，不会污染 `default` network：
+
+| Demo | 角色数 | 耗时 | 场景 |
+|---|---|---|---|
+| `debate` | 6（主持人 / 正反 4 辩 / 评委）| ~10 min | 结构化辩论，多视角碰撞 |
+| `socialmedia` | 4（选题 / 文案 / 配图 / 审核）| ~3 min | 小红书 / 微博内容流水线 |
+| `pr-review` | 4（安全 / 性能 / 风格 reviewer + judge）| ~2 min | 代码 PR 三 reviewer 并行审查 |
+| `sci-team` | 1 leader + N-1 worker（默认 10）| Phase 1 | 科研分工，可调 5-50 人规模 |
+
+`pr-review` 是技术团队最快感受价值的——三个 reviewer Agent 并行出报告，judge Agent 汇总，两分钟全自动。
+
+> **实测 caveat（Fix 13 PTY）**：`anet demo socialmedia` 在本机 PTY 已验证可调用，CLI 解析正常，退出信息清晰（`❌ 需要 MiniMax key. 用 --key 或 export MINIMAX_KEY=...`），进程退出干净无残留。完整 4 Agent 协作输出需要有效的 Provider API key（MINIMAX_KEY 或等价 key）。示例输出见 [anet.sh/guide/demos](https://anet.sh/guide/demos)。
+
+---
+
+## 7. 不适合 anet 的场景
+
+这门课 ¥199。退款比续费麻烦，所以提前把不适合的说清楚。
+
+**你只有单 Agent 任务**。一个 Claude Code session 处理你的所有工作，从不需要并行或协作——anet 是杀鸡用牛刀，直接用 Claude Code 就好。
+
+**需要严格的 DAG 工作流**。你的流程有明确的条件分支、多步依赖、失败重试逻辑——LangGraph 的工作流引擎比 anet 的自由 Mesh 更适合，工程上更可控。
+
+**大规模生产编排（百节点以上）**。anet 目前是本地工具定位，单 Hub 承载大量高频并发任务时，建议先跑压测再决定。官方没有生产规模的 benchmark 数据（实测信息以官方文档为准）。
+
+**需要 GPU 调度 / 容器编排**。训练、推理、资源调度不在 anet scope 里，去找 Kubernetes / Ray。
+
+**严格的企业合规（SOC 2 / ISO 27001）**。anet 是开源本地工具，没有企业级审计报告。如果你的团队有 compliance 要求，需要自己评估。
+
+**需要深度集成 Slack / Notion / Jira**。anet 有 Telegram channel 支持（README 标注已跑通），其他平台未做。
+
+### Mesh 的代价：可观测性盲区
+
+LangGraph 的 DAG 有明确 step trace，每步可回溯。anet 的 Mesh + 17 MCP 工具自由派活，当 6 个 Agent 互相 `send_task` 时，**任务链路调试主要靠 Dashboard Tasks panel + SQLite `~/.commhub/commhub.db` 直接 SQL**。
+
+CH 2 *CommHub 通信中枢* 会展开这部分：SQLite schema 全字段 + 完整调用链追踪 SQL + 常见 "task ID 漂移" / "agent alias 冲突" / "reply 路由失败" 三类问题的诊断 playbook。
+
+---
+
+## 8. 后续 6 章干什么
+
+花 ¥199 买这门课，你拿到的不是一个 Hello World 教程——是 anet 整个架构从原理到生产的完整拆解。
+
+**CH 1 — 快速上手**（下一章，紧接着这节）：从零到第一个 Agent 上线——Hub 启动、Dashboard 接入、`anet node create` 交互选型全过程，外加 PR Review Demo 完整跑通。每一步卡在哪会卡、为什么卡、怎么解，不跳坑。
+
+**CH 2 — CommHub 通信中枢深度**：17 个 MCP 工具 — `send_task` / `report_status` / `get_all_status` 的源码级追踪，外加 Mesh 派活的常见错误："task ID 漂移" / "回复路由失败" / "agent alias 冲突" 三类问题诊断 playbook + SQLite schema 读法。
+
+**CH 3 — Runtime 与 Provider 切换实战**：三种 Runtime 真实差异（`claude-code-cli` vs `claude-agent-sdk` vs `codex-sdk`），不只是一张表——是哪个 runtime 在什么边界条件下掉链子。Provider 混搭的成本计算方式，`ANTHROPIC_BASE_URL` 背后的协议细节，以及 tool_use 不兼容时怎么降级。
+
+**CH 4 — 多机部署 + 公网安全**：把 Hub 开放到 LAN / 公网的完整步骤（`--host 0.0.0.0`），Caddy 反代 + TLS 配置，默认账号 `admin/anethub` 必须改密的时机和方法，让不同城市的 Agent 加入同一 Hub 的网络配置——以及如果你跳过安全配置直接暴露 9200 端口会发生什么。
+
+**CH 5 — Web Dashboard 7 个面板实战**：Overview 节点拓扑、Nodes 管理、Tasks 查询、Messages 历史、Chat 人机协作、Admin 用户管理、Settings 配置——每个面板能做什么、什么时候会骗你（数据没刷新 / 状态滞后 / 历史截断）。
+
+**CH 6 — 完整 Case Study（end-to-end）**：一个真实项目从 0 到多 Agent 协作跑通：任务拆解设计、Agent 角色定义、跑通 → 卡住 → 排查 → 上线的完整过程，含架构决策的取舍记录。
+
+---
+
+## 9. 立即开始
+
+[查看课程详情 / 加入学习](https://blueleap.pro/courses/ai-agent-army)
+
+课程**一次买断 / 终身访问**，跟随 anet 版本持续更新——当前已更新 3 次（v0.6 → v0.8 → v0.10）。
+
+> anet 当前稳定版是 `v2.2.1` / `@sleep2agi/agent-network`，Apache 2.0 开源。次要版本之间 API 仍可能变动，课程会同步更新重要 breaking change。
+
+---
+
+## 附录：anet CLI 命令速查（v2.2.1 实测）
+
+```bash
+# Hub 管理
+anet hub start                   # 启动 CommHub Server（:9200）
+anet hub dashboard               # 启动 Web Dashboard（:3000）
+
+# 节点管理
+anet node create <name>          # 创建节点（交互式选 runtime + provider）
+anet node start <name>           # 启动节点（前台运行）
+anet node start <name> --tmux    # 在 tmux session 里启动
+anet node stop <name>            # 停止节点
+anet node ls                     # 列出所有节点
+anet logs <name>                 # 查看节点日志
+
+# 多节点项目
+anet project up                  # 启动当前目录下所有节点
+anet project down                # 停止所有节点
+
+# Demo
+anet demo debate --topic "..."           # 6 角色辩论，~10 min
+anet demo socialmedia --topic "..."      # 4 角色内容工厂，~3 min
+anet demo pr-review --ref origin/main   # 4 角色 PR 审查，~2 min
+anet demo sci-team                       # 科研军团，Phase 1 scaffold
+
+# 账号
+anet login --username admin --password anethub   # 首次登录（记得改密）
+anet passwd                                        # 改密
+anet whoami                                        # 当前用户 + 所在 network
+
+# 诊断
+anet doctor                      # 系统诊断
+anet -v                          # 版本 + 依赖报告
+```
+
+> 前置要求：Node.js >= 22.13.0。低版本会触发 `EBADENGINE` 警告（`@inquirer/prompts` 等依赖要求）。
