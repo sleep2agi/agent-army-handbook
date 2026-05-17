@@ -1,7 +1,7 @@
 {
   "title": "AI Agent 军团实战",
   "subtitle": "用 anet 把 Claude / GPT / MiniMax 跑成你自己的多 Agent 团队",
-  "cover": "/ai-agent-army/cover.jpg",
+  "cover": "/logo-blueleap.jpg",
   "price_fen": 19900,
   "original_price_fen": 99900,
   "topics": ["CommHub", "MCP", "SSE", "Multi-Runtime", "Multi-LLM", "Multi-Machine", "Dashboard"],
