@@ -1,0 +1,756 @@
+---
+title: "8 家 LLM Provider 一键切换与成本混搭"
+order: 2
+estimated_minutes: 20
+---
+
+# 8 家 LLM Provider 一键切换与成本混搭
+
+> 同一个 Hub，同一套 MCP 工具，通过 `ANTHROPIC_BASE_URL` 一行变量，把不同 Agent 的大脑换成不同厂商的模型——这是 anet 多 Provider 支持的核心机制。
+
+## 0. 一句话先讲明白
+
+**anet 支持 8 家 LLM Provider（Anthropic / OpenAI / MiniMax / DeepSeek / GLM / Kimi / 书生 / OpenRouter），在 `anet node create` 时配置，或事后改一个环境变量切换。** 成本混搭的原则很简单：主力 Agent 用工具调用稳定的 Provider，纯生成/翻译子 Agent 用便宜的，长上下文任务选上下文窗口大的。
+
+---
+
+## 你将学到
+
+- `ANTHROPIC_BASE_URL` 一行切换的真实工作原理，以及为什么叫"Anthropic"但能接 DeepSeek
+- 两个不能混淆的概念：`anet node create` 的 **7 个 vendor preset** vs 实际可接的 **8 家 Provider**，以及它们之间的桥接关系
+- 8 家 Provider 的接入方式、价格量级、适用场景完整对照
+- 成本混搭三分法：主力 Agent / 重活 Agent / 长上下文 Agent 各配什么
+- 交叉引用：agentic-engineer 课 `01-mindset/02-multi-model-backends` 的深度协议细节
+
+## 适合谁
+
+已跑通 CH1（第一个节点上线），看完 CH3-L01（三种 Runtime 对比），准备给不同 Agent 配不同模型省钱的读者。
+
+---
+
+## 1. 先厘清两个不同层面，避免「7 和 8 在脑子里打架」
+
+开始讲配置之前，必须先说清两个经常被混淆的概念。
+
+### 1.1 层面 A：`anet node create` 的 vendor 选单 preset（7 个）
+
+运行 `anet node create <name>` 选完 runtime 后，CLI 弹出的 vendor 选单固定有 7 个内置 preset：
+
+```
+? Select provider:
+  intern       上海 AI Lab 书生（Intern）
+  minimax      MiniMax
+  mimo         小米 MiMo
+  anthropic    Anthropic Claude（官方 API）
+  codex        Codex / GPT（需 codex auth login）
+  claude-code  Claude Code CLI（需 Claude Pro/Team/Max 订阅）
+  custom       自定义：任何 Anthropic 兼容 API
+```
+
+这 7 个是 anet wizard 帮你预填好 base_url 和配置结构的「快捷选项」。
+
+> 源码已在 CH1-L02 核定：7 个 preset，不是 6 个也不是 8 个。本节不引入任何修订。
+> `claude-code` preset 就是 CH3-L01 里讲的 `claude-code-cli` runtime——同一个东西，wizard 里用 vendor key `claude-code`，runtime 字段值是 `claude-code-cli`。
+
+### 1.2 层面 B：实际可接的 LLM Provider（8 家）
+
+而本节讲的「8 家 Provider」是另一个维度：**你能通过 `ANTHROPIC_BASE_URL` 切换、让 Agent 真正调用的 LLM 厂商**。8 家是可接的 LLM 厂商；其中只有书生 + MiniMax 有 Docker E2E 全链路验证：
+
+Anthropic / OpenAI / MiniMax / DeepSeek / GLM（智谱）/ Kimi（Moonshot）/ 书生（InternLM）/ OpenRouter
+
+### 1.3 桥接关系：7 个 preset 怎么接进 8 家 Provider
+
+两个数字不矛盾。关键是 **`custom` preset 是连接两个层面的通用口子**。
+
+下表把 8 家 Provider 和 7 个 preset 的对应关系一次说清：
+
+| LLM Provider | 有无专属 preset | 怎么接 | 备注 |
+|---|---|---|---|
+| Anthropic | ✅ `anthropic` | 直选 preset，填官方 key | 原生 Anthropic Messages API |
+| MiniMax | ✅ `minimax` | 直选 preset，envKey `ANTHROPIC_AUTH_TOKEN` | Docker E2E 全链路验证 |
+| 书生 InternLM | ✅ `intern` | 直选 preset，envKey `ANTHROPIC_AUTH_TOKEN` | Docker E2E 全链路验证 |
+| MiMo | ✅ `mimo` | 直选 preset，envKey `ANTHROPIC_AUTH_TOKEN` | real-call 验证，不在 Docker E2E 2 家里 |
+| OpenAI / GPT | ✅ `codex` | 直选 preset，需 `codex auth login` | Codex runtime 下接 OpenAI 账号 |
+| Claude Code | ✅ `claude-code` | 直选 preset，需 Claude Pro/Team/Max 订阅 | 即 CH3-L01 的 `claude-code-cli` runtime |
+| DeepSeek | ❌ 无专属 preset | 选 `custom`，填 base_url + key | 走 custom 口子接入 |
+| GLM（智谱） | ❌ 无专属 preset | 选 `custom`，填 GLM Anthropic 兼容 endpoint | 走 custom 口子接入 |
+| Kimi（Moonshot） | ❌ 无专属 preset | 选 `custom`，填 Moonshot Anthropic 兼容 endpoint | 走 custom 口子接入 |
+| OpenRouter | ❌ 无专属 preset | 选 `custom`，填 OpenRouter endpoint | 走 custom 口子接入 |
+
+**简单说**：8 家 Provider 里，Anthropic、MiniMax、书生、OpenAI/Codex 有 wizard 内置专属 preset；另外 4 家（DeepSeek、GLM、Kimi、OpenRouter）全部通过 `custom` preset + 手填 `ANTHROPIC_BASE_URL` 接入。MiMo 和 claude-code 是 7 个 preset 里的另外两个，它们不在本节「8 家」清单里，但用法与有 preset 的其他家一致。
+
+「7 个 preset」和「8 家 Provider」是「wizard 快捷选项数」和「本节重点讲的可接厂商数」两个维度，不互斥。
+
+---
+
+## 2. `ANTHROPIC_BASE_URL` 一行切换的原理
+
+为什么一个叫 `ANTHROPIC_BASE_URL` 的变量能接 DeepSeek？要从 anet 用的底层 SDK 说起。
+
+### 2.1 `claude-agent-sdk` runtime 的传输层
+
+`claude-agent-sdk` 使用 `@anthropic-ai/claude-agent-sdk`，它的 HTTP 客户端在发 `POST /v1/messages` 时，从当前进程的 `ANTHROPIC_BASE_URL` 环境变量读取根 URL。如果这个变量指向一个第三方端点，SDK 就把请求发过去——**SDK 不知道也不关心对面是不是 Anthropic 自己的服务器，只要返回符合 Anthropic Messages API response schema 的 JSON 就能继续跑**。
+
+这是 Anthropic SDK 的通用设计，不是 anet 特有的 hack。agentic-engineer 课 `01-mindset/02-multi-model-backends` 第 1 节从 Claude Code 二进制 string table 层面拆解过这套机制（含完整 env var 清单和 `ANTHROPIC_AUTH_TOKEN` vs `ANTHROPIC_API_KEY` 的区别），本节不重复，只讲 anet 场景下的差异点。
+
+### 2.2 anet 的接入模型：只有一条路
+
+所有 Provider 的接入机制只有一种：**`ANTHROPIC_BASE_URL` 直连**。
+
+真正的区分不是"路径 A/B"，而是：
+
+| 类型 | Provider | 机制 |
+|---|---|---|
+| **(a) 有 wizard 内置 preset** | anthropic / minimax / intern / mimo / codex / claude-code | wizard 自动填好 base_url + envKey，`anet node create` 时选就行 |
+| **(b) 无 preset，走 `custom`** | DeepSeek / GLM / Kimi / OpenRouter（任何 Anthropic 兼容 API）| `anet node create` 选 `custom`，手填 `ANTHROPIC_BASE_URL` + API key |
+
+**一个关键澄清——DeepSeek 有原生 Anthropic 兼容端点**：`https://api.deepseek.com/anthropic`（实测 401 非 404，端点存在，key 验证正常）。DeepSeek 不需要任何协议翻译中间层，直接用 `ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic` + `ANTHROPIC_AUTH_TOKEN` 即可接入。「DeepSeek 必须走 CCR 协议翻译」是历史叙事——那是 DeepSeek 上线原生 Anthropic 兼容端点**之前**的临时 workaround，现在不适用。anet multi-model 文档里所有 provider 都走 `claude-agent-sdk` + `ANTHROPIC_BASE_URL` 直连，无一例外。
+
+**为什么"直接改变量就生效"**：第三方 Provider 实现 Anthropic Messages API spec 后，对外暴露的端点接受和返回的 JSON schema 与 `api.anthropic.com` 完全相同。`claude-agent-sdk` 的 HTTP 客户端不检查对面是哪家公司，只要 response 解析得了就继续跑。改 `ANTHROPIC_BASE_URL` 就是把这个客户端的"收件地址"换掉，对上层 Agent 逻辑完全透明。
+
+### 2.3 anet 节点里怎么设置
+
+节点配置文件（`.anet/nodes/<name>/config.json`）里，环境变量通过 `envRef` 机制存储。真实字段结构（源码 `saveProfile` 函数，`agent-network/bin/cli.ts`）：
+
+```json
+{
+  "anet_version": "0.10.x",
+  "node_id": "...",
+  "node_name": "my-agent",
+  "runtime": "claude-agent-sdk",
+  "model": "deepseek-chat",
+  "hub": "http://127.0.0.1:9200",
+  "token": "ntok_...",
+  "channels": [],
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": { "_envRef": "DEEPSEEK_API_KEY" }
+  },
+  "flags": {},
+  "session": ""
+}
+```
+
+几个要点：
+
+- **没有 `provider` 对象**：config.json 没有 `"provider":{...}` 字段，Provider 信息靠 `env.ANTHROPIC_BASE_URL` + 顶层 `model` 字段编码。
+- **`envRef` 形状**：`{ "_envRef": "DEEPSEEK_API_KEY" }`——单 key `_envRef`，无 `type` 字段（源码 `cli.ts:1211` + `agent-node/src/cli.ts:161`）。key 不落盘为明文，运行时从当前 shell 的 `DEEPSEEK_API_KEY` 环境变量读取。`anet doctor` 会检测 config 里的 plain-secret，有则报 `⚠`。
+- **envKey 用 `ANTHROPIC_AUTH_TOKEN`**：除 Anthropic 官方 preset（用 `ANTHROPIC_API_KEY`）外，所有其他 provider（含 custom）的 envKey 都是 `ANTHROPIC_AUTH_TOKEN`（源码 VENDORS 列表）。
+- **模型切换用 `MODEL`**：agent-node 读 `process.env.MODEL`（源码 `agent-node/src/cli.ts:202`），shell 临时覆盖用 `MODEL=deepseek-chat`，不是 `ANTHROPIC_MODEL`（该变量对 agent-node 无效）。
+
+也可以在启动节点前临时用 shell 环境变量切换，不改 config：
+
+```bash
+# 不改 config，临时切 Provider 跑一次
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic \
+ANTHROPIC_AUTH_TOKEN=${DEEPSEEK_API_KEY} \
+MODEL=deepseek-chat \
+anet node start my-agent
+```
+
+> **注意**：shell 环境变量覆盖 config 里的值，但 session 结束后不持久。长期切换请改 config.json 然后重启节点——改配置 = 编辑 `config.json` + `anet node stop <name>` + `anet node start <name>`，没有独立的 `anet node edit` 命令。
+
+### 2.4 节点已创建后怎么换 Provider
+
+如果节点已经用某个 Provider 跑了一段时间，现在想换，有两种方法：
+
+**方法一：直接编辑 config 文件**（推荐，最直接）
+
+```bash
+# 找到节点 config 位置（在节点的工作目录下）
+cat .anet/nodes/<name>/config.json
+
+# 直接编辑，改 env.ANTHROPIC_BASE_URL 和顶层 model 字段
+# 改完重启节点
+anet node stop <name>
+anet node start <name>
+```
+
+**方法二：通过 shell env 临时覆盖**
+
+```bash
+# 只改这一次启动，下次 start 还是走 config 里的配置
+ANTHROPIC_BASE_URL=https://api.moonshot.cn/anthropic \
+ANTHROPIC_AUTH_TOKEN=${MOONSHOT_API_KEY} \
+MODEL=kimi-k2-turbo \
+anet node start <name>
+```
+
+**方法三：删掉旧节点重建**（最干净，适合 Provider 差异大时）
+
+```bash
+anet node stop <name>
+anet node delete <name>
+# 重新 create，wizard 里选新的 provider
+anet node create <name>
+```
+
+> 注意：`anet node delete` 会删掉节点配置，但节点历史任务仍保留在 `~/.commhub/commhub.db`（Hub 侧数据库）里，不会丢失任务记录。
+
+---
+
+## 3. 8 家 Provider 详细对照
+
+下表覆盖 8 家 Provider 的接入方式、关键配置、价格量级（USD / 百万 token，2026-04 公开定价，具体以各厂官网为准）。
+
+> **价格说明**：表中标注来自各厂商 2026-04 公开 API 价格页。模型 ID 和定价随时变动，配置前务必核官网最新价。汇率按 1 USD ≈ 7.25 CNY 粗算。
+
+### 3.1 Anthropic（有专属 preset）
+
+```bash
+# anet node create 时选 preset: anthropic
+# 或用环境变量直接创建：
+ANTHROPIC_BASE_URL=https://api.anthropic.com \
+ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY} \
+anet node create 主力助手 --runtime claude-agent-sdk --model claude-sonnet-4-6
+```
+
+| 模型 | input ($/M) | cached_in ($/M) | output ($/M) | 上下文 |
+|---|---|---|---|---|
+| claude-sonnet-4-6 | $3 | $0.30 | $15 | 200K |
+| claude-haiku-4-5 | $0.80 | $0.08 | $4 | 200K |
+| claude-opus-4-6 | $15 | $1.50 | $75 | 200K |
+
+**适用场景**：主力 Agent、需要 MCP/tool_use 稳定性最高的节点、复杂推理任务、需要 prompt cache 降本的高频场景。
+
+**为什么多 Agent 场景里 Anthropic 不只是"最贵的那个"**：anet 节点的 system prompt 包含 MCP 工具描述 + 角色定义，通常 2000-6000 token。一旦节点接受第二个任务，这部分 prompt 就命中 cache（$0.30 vs $3，降 10x）。多 Agent 协作场景里任务频率高，cache 命中率自然也高——Anthropic 的实际有效成本比标价低得多。
+
+**anet 验证状态**：`claude-agent-sdk` + `anthropic` preset 有 Docker E2E 覆盖（节点真启动 → 真 LLM 调用 → MCP 任务往返）。国内访问 `api.anthropic.com` 建议走 Cloudflare Worker 或国内 API Gateway 中转，直连延迟高且有被限速风险。
+
+### 3.2 MiniMax（有专属 preset）
+
+```bash
+# anet node create 时选 preset: minimax
+# wizard 自动填入：
+# ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
+# envKey: ANTHROPIC_AUTH_TOKEN（填你的 MiniMax API Key）
+# model: MiniMax-M2.7（默认）
+# runtime: claude-agent-sdk
+
+# 或用环境变量直接创建：
+ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic \
+ANTHROPIC_AUTH_TOKEN=${MINIMAX_API_KEY} \
+anet node create 文案助手 --runtime claude-agent-sdk --model MiniMax-M2.7
+```
+
+| 模型 | input ($/M) | output ($/M) | 上下文 |
+|---|---|---|---|
+| MiniMax-M2.7 | 低档（以 MiniMax 官网 2026-05 最新为准）| — | 100K+ |
+
+**接入要点**：
+- 端点：`https://api.minimaxi.com/anthropic`（注意域名是 `minimaxi.com` 不是 `minimax.com`）
+- runtime：`claude-agent-sdk`
+- envKey：`ANTHROPIC_AUTH_TOKEN`（wizard 侧 key 字段名；shell 侧可用任意变量名）
+- 协议：Anthropic 兼容，直连无需任何中间层
+
+**适用场景**：国内直连低延迟、低成本批处理、多模态扩展（MiniMax 有图文音频 API）、成本敏感的子 Agent。
+
+**anet 验证状态**：`claude-agent-sdk` + `minimax` preset 经 Docker E2E **全链路验证**（节点真启动 → 真 LLM 调用 → MCP 任务往返），是 anet 验证最充分的两家国产 Provider 之一（另一家：书生）。
+
+> 模型 ID 和价格以 MiniMax 官网（platform.minimaxi.com）当前文档为准。
+
+### 3.3 书生 InternLM（有专属 preset）
+
+```bash
+# anet node create 时选 preset: intern
+# wizard 自动填入：
+# ANTHROPIC_BASE_URL=https://chat.intern-ai.org.cn   ← 裸域名，无 /anthropic 后缀
+# envKey: ANTHROPIC_AUTH_TOKEN（填你的书生 API Key）
+# model: intern-s2-preview（默认）
+# runtime: claude-agent-sdk
+
+# 或用环境变量直接创建：
+ANTHROPIC_BASE_URL=https://chat.intern-ai.org.cn \
+ANTHROPIC_AUTH_TOKEN=${INTERN_API_KEY} \
+anet node create 研究员 --runtime claude-agent-sdk --model intern-s2-preview
+```
+
+| 模型 | input ($/M) | output ($/M) | 上下文 |
+|---|---|---|---|
+| intern-s2-preview | 低档（以上海 AI Lab 官网最新为准）| — | 32K+ |
+| intern-s1-pro | 低档 | — | 32K+ |
+
+**接入要点**：
+- 端点：`https://chat.intern-ai.org.cn`（**裸域名，无 `/anthropic` 后缀**，与 MiniMax/GLM/Kimi 等不同）
+- runtime：`claude-agent-sdk`
+- envKey：`ANTHROPIC_AUTH_TOKEN`
+- 协议：Anthropic 兼容，直连
+- **vendor adapter**：从 anet v0.9.1 起，URL 匹配 `/intern-ai\.org\.cn/i` 时自动 prepend system-prompt bias 把书生行为掰回 Anthropic tool_use 标准（书生默认走"Thinking Process"文本，不发 `tool_use` blocks）。需要原始书生推理风格时，用 `anet node start <name> --prompt "你的 system prompt"` 替换（`--prompt` 是替换不是追加）。
+
+**适用场景**：学术/研究对照、低成本批处理、国产开源模型需求。
+
+**anet 验证状态**：`claude-agent-sdk` + `intern` preset 经 Docker E2E **全链路验证**，与 MiniMax 并列为 anet 验证最充分的两家国产 Provider。
+
+> 模型 ID 和价格以上海 AI Lab 官网（internlm.intern-ai.org.cn）最新公告为准。
+
+### 3.4 OpenAI / GPT（有专属 preset）
+
+```bash
+# anet node create 时选 preset: codex
+# 需要先完成 codex auth login
+codex auth login
+anet node create 代码机器 --runtime codex-sdk
+```
+
+**接入机制**：`codex` preset 走 `codex-sdk` runtime，通过 Codex CLI OAuth 账号连接 OpenAI——不走 `ANTHROPIC_BASE_URL`，和其余 provider 的接入机制不同，不要强行用 Anthropic env var 套。OAuth token 到期后需重新 `codex auth login`，是主要运维麻烦。
+
+**anet 验证状态**：`codex-sdk` 单元测试通过，真实 OAuth 流程未上 CI。稳定性详见 CH3-L01。主力 Agent 优先用 `claude-agent-sdk` + Anthropic；OpenAI 当补充备选，尤其 parallel_tool_calls 需求强时。
+
+> 模型 ID 和价格以 OpenAI 官方文档为准。
+
+### 3.5 DeepSeek（无专属 preset，走 custom）
+
+```bash
+# anet node create 时选 preset: custom
+# wizard 提示填入：
+# ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
+# ANTHROPIC_AUTH_TOKEN=（你的 DeepSeek API Key）
+# model: deepseek-chat
+
+# 或环境变量直接创建：
+ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic \
+ANTHROPIC_AUTH_TOKEN=${DEEPSEEK_API_KEY} \
+anet node create 代码审查 --runtime claude-agent-sdk --model deepseek-chat
+```
+
+| 模型 | input ($/M) | output ($/M) | 上下文 |
+|---|---|---|---|
+| deepseek-chat (V3.2) | $0.27 | $1.10 | 64K |
+| deepseek-reasoner | $0.55 | $2.19 | 64K |
+
+**接入路径**：DeepSeek 有原生 Anthropic 兼容端点 `https://api.deepseek.com/anthropic`，`claude-agent-sdk` 直连即可，无需任何协议翻译中间层。端点实测存在（401 = key 验证，非 404）。
+
+**适用场景**：成本压缩的主力选项（比 Anthropic Sonnet 便宜约 11x input / 13x output）、纯生成/翻译子 Agent、deepseek-reasoner 做深度思考任务。
+
+**工具调用坑**：DeepSeek 偶发"不调 tool，直接给文字答案"——tool_use 稳定性低于 Anthropic / GLM / Kimi。有复杂 MCP 工具集的 Agent 不要用 DeepSeek 当主力，详见 CH3-L03。
+
+**DeepSeek 在 anet 里最适合的是什么**：没有工具调用的纯文本 Agent——写作、总结、翻译、代码注释生成。任务特征是"输入 → 模型 → 输出"的直线流，这正好是 DeepSeek 最稳的场景，也是价格优势最明显的地方。
+
+**新注册免费额度**：DeepSeek 新注册账号有免费 token 额度，是 0 成本试跑 custom preset 的最快路径。
+
+### 3.6 GLM（智谱，无专属 preset，走 custom）
+
+```bash
+# anet node create 时选 preset: custom
+# ANTHROPIC_BASE_URL=https://open.bigmodel.cn/anthropic
+# ANTHROPIC_AUTH_TOKEN=（你的智谱 API Key）
+# model: glm-4.6
+
+ANTHROPIC_BASE_URL=https://open.bigmodel.cn/anthropic \
+ANTHROPIC_AUTH_TOKEN=${BIGMODEL_API_KEY} \
+anet node create 分析师 --runtime claude-agent-sdk --model glm-4.6
+```
+
+| 模型 | input ($/M) | output ($/M) | 上下文 |
+|---|---|---|---|
+| glm-4.6 | ~$0.60 | ~$2.20 | 128K |
+| glm-4-flash | ~$0.01 | ~$0.01 | 128K |
+
+**接入路径**：智谱 BigModel 开了 Anthropic Messages 兼容端点（`https://open.bigmodel.cn/anthropic`），直接改 `ANTHROPIC_BASE_URL` 接入，无需中间层。注意端点路径是 `/anthropic`（非 `/api/anthropic`，以 multi-model.md 实测为准）。
+
+**适用场景**：第三方 Provider 里 tool_use 稳定性最高（实测接近 Anthropic 兼容档），是国产 Provider 里最适合当主力 Agent 的。glm-4-flash 价格极低（约 $0.01/M，接近免费），适合高频轻量任务和日志类、摘要类 Agent。
+
+**GLM 在多 Agent 场景的优势**：GLM 走原生 Anthropic 兼容端点，这意味着工具描述的解析逻辑和 Anthropic 原版一致，MCP 工具集大的节点在 GLM 上跑起来比在 DeepSeek 上稳定得多。如果你想省钱又不想在 tool_use 上冒险，GLM 是最优先考虑的替代档位。
+
+> GLM Anthropic 兼容端点 `open.bigmodel.cn/anthropic` 来自 anet multi-model.md 实测记录，以智谱 BigModel 官网当前文档为准。
+
+### 3.7 Kimi（Moonshot，无专属 preset，走 custom）
+
+```bash
+# anet node create 时选 preset: custom
+# ANTHROPIC_BASE_URL=https://api.moonshot.cn/anthropic
+# ANTHROPIC_AUTH_TOKEN=（你的 Kimi API Key）
+# model: kimi-k2-turbo
+
+ANTHROPIC_BASE_URL=https://api.moonshot.cn/anthropic \
+ANTHROPIC_AUTH_TOKEN=${MOONSHOT_API_KEY} \
+anet node create 长文助手 --runtime claude-agent-sdk --model kimi-k2-turbo
+```
+
+| 模型 | input ($/M) | output ($/M) | 上下文 |
+|---|---|---|---|
+| kimi-k2-turbo | ~$0.60 | ~$2.50 | 128K |
+| moonshot-v1-128k | ~$1.70 | ~$2 | 128K |
+
+**接入路径**：Moonshot 开了 Anthropic 兼容端点（`https://api.moonshot.cn/anthropic`），`claude-agent-sdk` 直连，无需中间层。
+
+**适用场景**：长上下文任务（128K）、联网搜索能力（kimi-k2-turbo 支持 web search，适合做资讯 Agent 或需要实时信息的 Agent）、国产替代主力备选。tool_use 稳定性高，接近 GLM 档位。
+
+**Kimi 在 anet 的典型用法**：做"长 context 处理 + 搜索增强"的专职 Agent。比如 sci-team demo 里负责文献综述的 Agent，要读入大量学术摘要（可能超过 50K token）然后生成综述——这个 Agent 放 Kimi，既能撑住上下文又比 Anthropic 便宜。
+
+> Kimi Anthropic 兼容端点和模型 ID 请以 Moonshot 官网（platform.moonshot.cn）当前文档为准。
+
+### 3.8 OpenRouter（无专属 preset，走 custom）
+
+```bash
+# anet node create 时选 preset: custom
+# ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
+# ANTHROPIC_AUTH_TOKEN=（你的 OpenRouter API Key）→ SDK 发出 Authorization: Bearer 头
+# model: anthropic/claude-sonnet-4-6（OpenRouter model id 用 provider/model 格式）
+
+ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1 \
+ANTHROPIC_AUTH_TOKEN=${OPENROUTER_API_KEY} \
+anet node create 多模型助手 --runtime claude-agent-sdk --model anthropic/claude-sonnet-4-6
+```
+
+| 特点 | 说明 |
+|---|---|
+| 模型选择 | 聚合 100+ 模型，Claude/GPT/Llama/Mistral 等统一入口 |
+| 价格 | 按底层模型定价 + 小幅加成，价格透明 |
+| 适用场景 | 多模型横向对比实验、不想管理多家 key、fallback 多 Provider |
+
+**接入路径**：OpenRouter 走 `claude-agent-sdk` + `ANTHROPIC_BASE_URL` 直连，envKey 用 `ANTHROPIC_AUTH_TOKEN`（SDK 自动转成 `Authorization: Bearer` 头）。model id 用 OpenRouter 格式：`provider/model`，完整列表见 openrouter.ai/models。
+
+**适用场景**：实验/评估阶段快速切换多模型对比效果、没有多厂商账号管理能力的小团队（一个 key 覆盖全部模型）、教学/演示场景。
+
+**OpenRouter 的实际工程价值**：减少账号管理复杂度。一个 OpenRouter key 接 100+ 模型比挨家注册省事。但作为生产主力，OpenRouter 加成 + 无 cache 的总成本通常比直连各厂商贵，SLA 也多一层依赖。
+
+> OpenRouter 上的 Claude 模型价格有加成，prompt cache 是否透传以 OpenRouter 官方文档为准。
+
+---
+
+## 4. Provider → preset 对照速查表（一张表总结）
+
+| Provider | 专属 preset | 接入路径 | 协议 | tool_use 稳定性 | 价格档位 |
+|---|---|---|---|---|---|
+| Anthropic | `anthropic` | 直选 preset | 原生 Anthropic | ⭐⭐⭐⭐⭐（基准）| 中 |
+| OpenAI/GPT | `codex` | 直选 preset（需 codex auth）| Codex CLI OAuth | ⭐⭐⭐⭐ | 中 |
+| MiniMax | `minimax` | 直选 preset | Anthropic 兼容 | ⭐⭐⭐ | 低 |
+| 书生 InternLM | `intern` | 直选 preset | Anthropic 兼容 | ⭐⭐⭐（vendor adapter 修正）| 低 |
+| MiMo | `mimo` | 直选 preset | Anthropic 兼容 | ⭐⭐⭐ | 低 |
+| Claude Code | `claude-code` | 直选 preset（需订阅）| Claude Code CLI | ⭐⭐⭐⭐⭐ | 订阅制 |
+| GLM（智谱）| ❌ → `custom` | `ANTHROPIC_BASE_URL` 直连 | Anthropic 兼容 | ⭐⭐⭐⭐ | 低 |
+| Kimi（Moonshot）| ❌ → `custom` | `ANTHROPIC_BASE_URL` 直连 | Anthropic 兼容 | ⭐⭐⭐⭐ | 低 |
+| DeepSeek | ❌ → `custom` | `ANTHROPIC_BASE_URL` 直连 | Anthropic 兼容 | ⭐⭐ | 极低 |
+| OpenRouter | ❌ → `custom` | `ANTHROPIC_BASE_URL` 直连 | Anthropic 兼容（聚合）| 取决于底层模型 | 中低（加成）|
+
+> **tool_use 稳定性** 基于 agentic-engineer 课 `01-mindset/02-multi-model-backends` 第 10 节 + anet Docker E2E 数据，2026-04 实测状态。CH3-L03 专节展开各 Provider 的 tool_use 降级策略。
+
+---
+
+## 5. 成本混搭策略：三分法
+
+anet 多 Agent 场景的成本优化，核心思路是**按任务类型分层**，不是所有 Agent 都用同一个 Provider。
+
+### 5.1 三类 Agent 角色的 Provider 分配
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  角色一：主力 Agent（写代码、调工具、复杂推理、协调分工）      │
+│  Provider: Anthropic（首选）或 GLM / Kimi（备选）             │
+│  原因: tool_use 稳定，MCP 工具集大，精度要求高                │
+│                                                              │
+│  角色二：重活 Agent（大量文本生成、翻译、总结、批处理）        │
+│  Provider: DeepSeek（极致省钱）或 Kimi（长文本）             │
+│  原因: 不需要调工具，纯生成性能足够，价格低 10-13x            │
+│                                                              │
+│  角色三：长上下文 Agent（跨文件分析、大文档 QA、长对话）       │
+│  Provider: Anthropic Sonnet（200K + prompt cache）           │
+│           或 Kimi / GPT-4.1（128K / 1M 窗口）               │
+│  原因: 窗口大、重复 prompt 命中 cache 后 input 降到 1/10      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 典型分配方案（PR Review Demo 改造）
+
+`anet demo pr-review` 默认 4 个 Agent 都用你 Hub 的默认 Provider。如果改成混搭：
+
+```
+reviewer-security  → Anthropic Sonnet（安全审查需要精准工具调用）
+reviewer-perf      → GLM glm-4.6（性能 reviewer，tool_use 稳，成本低）
+reviewer-style     → DeepSeek deepseek-chat（代码风格纯文本审查，便宜）
+judge              → Anthropic Sonnet（汇总判断，需要处理长 context）
+```
+
+粗算：4 个 reviewer 原来全用 Sonnet，改完平均成本降 ~60%，精度基本不损（纯文本任务 DeepSeek 完全够用）。
+
+### 5.3 Prompt Cache 陷阱：切 Provider 前必看
+
+Anthropic prompt cache 让 system prompt 命中缓存时 input 降到 1/10（$3 → $0.30）。**切到第三方 Provider 就丢掉这层缓存**，原本 input 实际成本会回到 10x。
+
+计算是否值得切的简单公式：
+
+```
+命中 cache 的 Anthropic 实际 input 成本 ≈ (1 - P) × $3 + P × $0.30
+（P = cache 命中率）
+DeepSeek 切换后 input 成本 = $0.27（无 cache）
+当 P > 0.75 时，Anthropic + cache 的 input 成本可能低于 DeepSeek 无 cache
+```
+
+> `/cost` 命令是 `claude-code-cli` runtime 专属——只有节点走 `claude-code-cli`（即 `claude-code` preset）时才能在交互中跑 `/cost` 读 cache_read 比例。`claude-agent-sdk` 节点没有这个命令，需要从 API response 的 `usage.cache_read_input_tokens` 字段手动统计。
+
+实际上 Agent 场景的 system prompt（MCP 工具描述 + 角色定义）很容易命中高 cache 率，切 Provider 之前先确认 cache 命中比例再做决定。
+
+**anet 多 Agent 场景里，system prompt 包含什么**：每个 anet 节点启动时，节点的 system prompt 里包含它的 Agent 角色描述 + 它被分配到的 MCP 工具集描述。一个满配节点的 system prompt 可以轻松超过 5000 token。如果这个节点每 10 分钟就接一个新任务，system prompt 几乎每次都命中 cache（因为 system prompt 没有变）——这种场景下 Anthropic + cache 的实际 input 成本可以比 DeepSeek 无 cache 还低。
+
+详细计算过程见 agentic-engineer 课 `01-mindset/02-multi-model-backends` 第 9 节（含完整公式 + 临界点分析）。
+
+### 5.4 anet 多节点场景怎么分别设 Provider
+
+每个节点独立配置，不影响彼此。在节点目录下的 config.json 里改 `env.ANTHROPIC_BASE_URL` 和顶层 `model` 字段，或者用不同的 shell env var 前缀启动：
+
+```bash
+# 节点 1：Anthropic 主力
+cd ~/anet-projects/pr-review
+anet node create reviewer-security   # wizard 里选 anthropic preset
+
+# 节点 2：DeepSeek 轻量
+anet node create reviewer-style      # wizard 里选 custom，填 DeepSeek endpoint
+
+# 节点 3：GLM 备选
+anet node create reviewer-perf       # wizard 里选 custom，填 GLM endpoint
+
+# 同时启动（需要 anet project up 或分别 start）
+anet node start reviewer-security
+anet node start reviewer-style
+anet node start reviewer-perf
+```
+
+同一 Hub、同一 Network、同一套 MCP 工具——只是三个 Agent 用了不同的 LLM 大脑。Hub 不感知 Provider，只负责路由 MCP 消息。
+
+### 5.5 成本数字对照：同等任务量下各 Provider 月账单估算
+
+以 anet PR Review Demo 规模推算（4 Agent，每天跑 20 次 review，每次 ~2K input + ~1K output token）：
+
+| Provider 方案 | 月 input 成本 | 月 output 成本 | 月合计（USD）|
+|---|---|---|---|
+| 全用 Anthropic Sonnet（无 cache）| $3 × 4.8M = $14.4 | $15 × 2.4M = $36 | **$50.4** |
+| 全用 Anthropic Sonnet（cache 命中 70%）| ~$5.9 | $36 | **~$42** |
+| 混搭（Sonnet 主力 2 + DeepSeek 2）| ~$9 | ~$21 | **~$30** |
+| 全用 DeepSeek chat | $0.27 × 4.8M = $1.3 | $1.10 × 2.4M = $2.6 | **~$4** |
+
+> 数字只是量级参考，实际 token 消耗因任务规模和 system prompt 长度差异大。"混搭"方案在价格和质量之间通常是最优解，不是最便宜的也不是最贵的。
+
+核心结论：**不是"越便宜越好"**——如果你把有复杂 MCP 工具集的主力 Agent 也换成 DeepSeek，它有一定概率在 tool_use 调用上出问题，一次失败的 Agent 任务浪费的时间成本远超节省的几分钱 token 费。工具调用稳定性在多 Agent 系统里是比价格更重要的约束，下一节 CH3-L03 专门讲这个。
+
+---
+
+## 6. Provider 快速接入配置速查（custom preset 用法）
+
+对于没有专属 preset 的 4 家 Provider，以下是 `anet node create` 选 `custom` 后需要填入的配置。
+
+### 6.1 DeepSeek
+
+```
+base_url: https://api.deepseek.com/anthropic
+model:    deepseek-chat
+api_key:  { "_envRef": "DEEPSEEK_API_KEY" }
+```
+
+原生 Anthropic 兼容端点，直连无需协议翻译。wizard 填完后 config.json 的 env 字段：
+
+```json
+{
+  "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+  "ANTHROPIC_AUTH_TOKEN": { "_envRef": "DEEPSEEK_API_KEY" }
+}
+```
+
+### 6.2 GLM（智谱 BigModel）
+
+```
+base_url: https://open.bigmodel.cn/anthropic
+model:    glm-4.6
+api_key:  { "_envRef": "BIGMODEL_API_KEY" }
+```
+
+原生 Anthropic 兼容，直连。验证端点的最快方式：
+
+```bash
+curl https://open.bigmodel.cn/anthropic/v1/messages \
+  -H "x-api-key: ${BIGMODEL_API_KEY}" \
+  -H "content-type: application/json" \
+  -d '{"model":"glm-4.6","max_tokens":50,"messages":[{"role":"user","content":"ping"}]}'
+# 返回 Anthropic Messages schema 的 JSON 即可
+```
+
+### 6.3 Kimi（Moonshot）
+
+```
+base_url: https://api.moonshot.cn/anthropic
+model:    kimi-k2-turbo
+api_key:  { "_envRef": "MOONSHOT_API_KEY" }
+```
+
+原生 Anthropic 兼容，直连。
+
+### 6.4 OpenRouter
+
+```
+base_url: https://openrouter.ai/api/v1
+model:    anthropic/claude-sonnet-4-6（provider/model 格式）
+api_key:  { "_envRef": "OPENROUTER_API_KEY" }
+```
+
+envKey 用 `ANTHROPIC_AUTH_TOKEN`，SDK 自动将其转成 `Authorization: Bearer` 头发给 OpenRouter，与 OpenRouter 文档要求一致。model id 完整列表见 openrouter.ai/models。
+
+---
+
+## 7. 与 agentic-engineer 课的交叉引用
+
+本节刻意保持轻量，两处深度内容不在这里重复：
+
+- **`ANTHROPIC_BASE_URL` 完整 env var 清单 + `ANTHROPIC_AUTH_TOKEN` vs `ANTHROPIC_API_KEY` 区别**：agentic-engineer `01-mindset/02-multi-model-backends` 第 1 节
+- **tool_use 跨 Provider 兼容矩阵（全表）**：agentic-engineer 第 10 节；anet 场景降级策略见 CH3-L03
+
+其余（prompt cache 公式、settings.json env 写法）见上述两门课对应章节。
+
+---
+
+## 8. 换 Provider 之后的验证步骤
+
+切换 Provider 之后，不要直接上任务——先走三步验证，避免在真正任务里出问题才发现 Provider 没接通。
+
+### 8.1 步骤一：curl 验证 Provider 端点
+
+用最小请求确认 endpoint 能通、auth 正确、response schema 对：
+
+```bash
+# 对任何 Anthropic 兼容 Provider：
+curl "${ANTHROPIC_BASE_URL}/v1/messages" \
+  -H "x-api-key: ${ANTHROPIC_AUTH_TOKEN}" \
+  -H "content-type: application/json" \
+  -d '{
+    "model": "'"${MODEL}"'",
+    "max_tokens": 20,
+    "messages": [{"role": "user", "content": "reply with the word PONG only"}]
+  }'
+
+# 期望返回：{"id":"...","type":"message","role":"assistant","content":[{"type":"text","text":"PONG"}],...}
+# 如果返回 401/403 = key 问题
+# 如果返回 404 = base_url 路径问题（检查 /anthropic 后缀是否正确）
+```
+
+### 8.2 步骤二：`anet node start` 看日志
+
+```bash
+anet node start <name>
+# 看到：
+# SSE connected    → Hub 通道 OK
+# 初始化日志里有 LLM provider: <url>   → 确认接到了正确的 endpoint
+```
+
+如果节点 crash 或者 SSE 连不上，用 `anet logs <name>` 看错误原因。
+
+### 8.3 步骤三：发一条最小任务
+
+在 Hub 侧（另一个终端或 Dashboard Chat 面板）给新节点派一条轻量任务确认 LLM 调用真正跑通：
+
+```bash
+# 在另一个节点或 Dashboard Chat 里通过 MCP 发：
+# send_task to: <name>, content: "reply with the word READY and nothing else"
+```
+
+节点回复了 `READY` = LLM 调用链路完整。`curl` 端点能通只验证 HTTP 层，真正的 MCP tool_use 路径需要这步任务验证才算跑通。
+
+---
+
+## 9. 常见问题
+
+**Q：我用 custom preset 填了 DeepSeek endpoint，节点启动后 LLM 调用报 `invalid request body` 怎么回事？**
+
+A：最常见原因是 base_url 填的是旧的 OpenAI 兼容端点（`https://api.deepseek.com/v1`）。DeepSeek 的 Anthropic 兼容端点是 `https://api.deepseek.com/anthropic`，`/v1` 和 `/anthropic` 是两个不同路径。改成 `/anthropic` 端点重建节点即可。
+
+**Q：GLM 的 Anthropic 兼容端点 `open.bigmodel.cn/anthropic` 是永久的吗？**
+
+A：以智谱 BigModel 官网当前文档为准，endpoint 路径可能随版本更新。配置前核官网最新说明。（实测信息以官方文档为准。）
+
+**Q：OpenRouter 上的 Claude 模型和直连 Anthropic 有什么区别？**
+
+A：价格有 OpenRouter 加成（通常小幅），功能上 OpenRouter 透传底层 API，理论上功能一致。但 prompt cache 是否透传、rate limit 是否共享，以 OpenRouter 官方文档为准。多数场景直连 Anthropic 更划算（无加成 + 确定性 cache 支持）。
+
+**Q：MiMo（`mimo` preset）在「8 家」清单里吗？**
+
+A：`mimo` 是 7 个 wizard preset 里的一个，但不在本节重点讲的「8 家 Provider」清单里。MiMo 有 VENDORS preset + real-call 验证（endpoint `https://token-plan-cn.xiaomimimo.com/anthropic`，model `mimo-v2.5-pro`，envKey `ANTHROPIC_AUTH_TOKEN`），但不在 Docker E2E 全链路验证的 2 家（书生 + MiniMax）内。要用 MiMo 直接选 `mimo` preset 即可。
+
+**Q：Hub 感知 Provider 吗？能做跨 Provider 的请求路由吗？**
+
+A：Hub 不感知 Provider。Hub 只路由 MCP 消息（`send_task`、`report_status` 等），LLM 调用发生在各自节点内部，Hub 看不到。跨 Provider 路由需要在各节点配置层面预先分配，Hub 本身不做这件事。
+
+**Q：切 Provider 之后 `anet doctor` 会有什么变化吗？**
+
+A：`anet doctor` 检查的是 Hub 连通性、token 有效性、节点 SSE 状态等，不检查 LLM Provider 连通性。换了 Provider 之后 `anet doctor` 的输出不会变——Provider 层的验证需要用 §8.1 的 curl 步骤自己做。
+
+---
+
+## 总结
+
+本节覆盖了四件事：
+
+1. **厘清两个层面**：7 个 wizard preset 是快捷选项（intern / minimax / mimo / anthropic / codex / claude-code / custom），8 家 Provider 是本节重点讲的可接 LLM 厂商；DeepSeek/GLM/Kimi/OpenRouter 没有专属 preset，全部通过 `custom` + `ANTHROPIC_BASE_URL` 接入；`claude-code` preset 就是 CH3-L01 的 `claude-code-cli` runtime
+
+2. **接入原理**：只有一条路——`ANTHROPIC_BASE_URL` 直连。所有 provider 都走 `claude-agent-sdk` + `ANTHROPIC_BASE_URL`，包括 DeepSeek（有原生 Anthropic 兼容端点 `/anthropic`）。区分只是「有 wizard preset」vs「走 custom 手填」
+
+3. **成本混搭三分法**：主力 Agent 用 Anthropic/GLM（tool_use 稳）、重活 Agent 用 DeepSeek/GLM-flash（便宜）、长上下文 Agent 用 Anthropic+cache 或 Kimi/GPT-4.1（窗口大）；切 Provider 前先算 prompt cache 命中率，高命中率场景切出去不一定省钱。核心约束：tool_use 稳定性比价格重要，主力 Agent 不要为省钱牺牲稳定性
+
+4. **换 Provider 后的验证三步**：curl 验证端点 schema → `anet node start` 看 SSE 日志 → 发最小任务确认 LLM 链路通，三步跑完再上真正的任务
+
+下一节 CH3-L03 展开 tool_use 不兼容时的降级策略——这是多 Agent 系统里耗时最多的 debug 类型，也是选 Provider 时最容易踩的坑。
+
+---
+
+## 附录：本节快速配置速查
+
+```bash
+# --- Anthropic（专属 preset）---
+# wizard: 选 anthropic
+# config.json env key: ANTHROPIC_API_KEY
+
+# --- MiniMax（专属 preset）---
+# wizard: 选 minimax
+# ANTHROPIC_BASE_URL=https://api.minimaxi.com/anthropic
+# config.json env key: ANTHROPIC_AUTH_TOKEN
+# （shell 侧可用 MINIMAX_KEY 等任意名称，wizard 存进 config.json 的字段是 ANTHROPIC_AUTH_TOKEN）
+# model: MiniMax-M2.7
+
+# --- 书生 InternLM（专属 preset）---
+# wizard: 选 intern
+# ANTHROPIC_BASE_URL=https://chat.intern-ai.org.cn   ← 裸域名，无 /anthropic
+# config.json env key: ANTHROPIC_AUTH_TOKEN
+# （shell 侧可用 INTERN_KEY 等任意名称，wizard 存进 config.json 的字段是 ANTHROPIC_AUTH_TOKEN）
+# model: intern-s2-preview
+
+# --- 小米 MiMo（专属 preset）---
+# wizard: 选 mimo
+# ANTHROPIC_BASE_URL=https://token-plan-cn.xiaomimimo.com/anthropic
+# config.json env key: ANTHROPIC_AUTH_TOKEN
+# model: mimo-v2.5-pro
+
+# --- OpenAI/GPT（专属 preset）---
+# wizard: 选 codex，然后：
+codex auth login
+
+# --- GLM（智谱，无专属 preset）---
+# wizard: 选 custom
+# base_url: https://open.bigmodel.cn/anthropic
+# model:    glm-4.6
+# env:      ANTHROPIC_AUTH_TOKEN → BIGMODEL_API_KEY
+
+# --- Kimi（Moonshot，无专属 preset）---
+# wizard: 选 custom
+# base_url: https://api.moonshot.cn/anthropic
+# model:    kimi-k2-turbo
+# env:      ANTHROPIC_AUTH_TOKEN → MOONSHOT_API_KEY
+
+# --- DeepSeek（无专属 preset）---
+# wizard: 选 custom
+# base_url: https://api.deepseek.com/anthropic   ← 原生 Anthropic 兼容端点，直连
+# model:    deepseek-chat
+# env:      ANTHROPIC_AUTH_TOKEN → DEEPSEEK_API_KEY
+
+# --- OpenRouter（无专属 preset）---
+# wizard: 选 custom
+# base_url: https://openrouter.ai/api/v1
+# model:    anthropic/claude-sonnet-4-6（provider/model 格式）
+# env:      ANTHROPIC_AUTH_TOKEN → OPENROUTER_API_KEY（SDK 转成 Authorization: Bearer）
+
+# --- 验证 Provider 是否兼容 Anthropic Messages ---
+curl ${ANTHROPIC_BASE_URL}/v1/messages \
+  -H "x-api-key: ${ANTHROPIC_AUTH_TOKEN}" \
+  -H "content-type: application/json" \
+  -d '{"model":"'"${MODEL}"'","max_tokens":20,"messages":[{"role":"user","content":"hi"}]}'
+# 返回 Anthropic Messages schema 的 JSON = 接入成功
+# 返回 401 = key 问题；404 = base_url 路径问题（检查 /anthropic 后缀）
+```
+
+> 本节基于 anet v0.10.8（umbrella 产品版）。节点 CLI 包 `@sleep2agi/agent-network` 版本以 `anet -v` 实际输出为准（当前 v2.2.x 范围）。各厂 endpoint、model id、价格以各官网当前文档为准。

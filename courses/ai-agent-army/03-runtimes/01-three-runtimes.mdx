@@ -1,0 +1,534 @@
+---
+title: "三种 Runtime 怎么选 — claude-code-cli / claude-agent-sdk / codex-sdk"
+order: 1
+estimated_minutes: 18
+---
+
+# 三种 Runtime 怎么选 — claude-code-cli / claude-agent-sdk / codex-sdk
+
+> 同一个 Hub 上，不同 Agent 可以跑不同 Runtime。这不是冗余设计，是故意的——三种 Runtime 对应三种完全不同的生命周期和底层进程，搞清楚各自的边界条件，才能在出问题时知道该去哪里查。
+
+## 0. 一句话先讲明白
+
+**`claude-agent-sdk` 是最稳的主力底座，有 Docker E2E 全链路覆盖；`claude-code-cli` 工具链最完整但未自动化回归，适合有 Claude Pro 订阅的单人高速迭代；`codex-sdk` 接 OpenAI 生态，单元测试通过但真实 OAuth 未上 CI。** 三者可在同一个 Hub 上混搭——不同角色的 Agent 选不同 Runtime，各取所长。
+
+---
+
+## 你将学到
+
+- 三种 Runtime 的定位差异：底层用什么进程、谁来跑 LLM 调用
+- 各自的掉链子边界条件：哪条路有 E2E 覆盖、哪条没有自动化回归、哪条 OAuth 未上 CI
+- `anet node create --runtime <x>` 实测输出与各 Runtime 的 `config.json` 字段差异
+- 同一个 Hub 上混搭三种 Runtime 的正确姿势
+- 选型速查：4 个问题定位你的场景
+
+## 适合谁
+
+已跑通 CH1（Hub 在 `:9200` 运行、至少有一个 Agent 节点上线），现在想为不同 Agent 角色选对 Runtime、或者遇到节点行为异常想弄清楚是哪一层出问题的读者。
+
+---
+
+## 1. 三种 Runtime 是什么
+
+在 anet 里，"Runtime" 决定**节点进程的执行环境**：同样是从 Hub 收一条 `send_task`，不同 Runtime 用不同的进程模型来跑 LLM 和工具调用。
+
+```bash
+# 创建节点时指定 runtime
+anet node create 指挥官 --runtime claude-code-cli
+anet node create 写作兵 --runtime claude-agent-sdk
+anet node create 代码兵 --runtime codex-sdk
+```
+
+实测 `anet node create --help` 输出：
+
+```
+Usage: anet node create <node-name> [--runtime claude-code-cli|codex-sdk|claude-agent-sdk] [--model ...] [--tools ...]
+Or run fully interactive: anet node create
+```
+
+三个值完整，没有第四个。
+
+`anet node ls` 的 RUNTIME 列会直接显示，可随时查当前网络里各节点跑的是哪个 Runtime：
+
+```
+NAME          RUNTIME           STATUS    SSE
+─────────────────────────────────────────────
+指挥官        claude-code-cli   idle      ●
+写作兵        claude-agent-sdk  idle      ●
+代码兵        codex-sdk         idle      ●
+```
+
+---
+
+## 2. `claude-code-cli` — 订阅制用户的主力
+
+> **Cross-ref**：`anet node create` 的完整交互流程（选 vendor、填 API key、确认网络）见 CH1 L02 §2，本节只讲三种 Runtime 之间的差异字段与行为。
+
+### 2.1 底层是什么
+
+`claude-code-cli` Runtime 把 Claude Code CLI（`claude` 命令）当作执行引擎。anet 启动时，spawn 一个 `claude` 进程，传入 Hub 连接参数（Hub URL、node token、CommHub channel 地址），然后让 Claude Code 自己跑任务循环。
+
+```
+anet node start 指挥官
+    ↓
+spawn: claude --resume <session_id>
+       --dangerously-load-development-channels server:commhub
+       --channels plugin:telegram@claude-plugins-official  （如果配了 Telegram channel）
+    ↓
+claude 进程跑 Agent 主循环
+    ↓
+收到 CommHub MCP 工具推过来的任务 → 处理 → 用 commhub_reply 回复
+```
+
+（源码：`agent-network/bin/cli.ts:2248`，对 `server:` 前缀的 channel 统一用 `--dangerously-load-development-channels` 而非 `--add-mcp-server`。）
+
+anet 不代理 claude 进程的任何输出（`stdio: "inherit"`，即 Node.js `child_process` 的继承模式），你在终端看到的全是 Claude Code 自己打出来的。
+
+### 2.2 实测创建输出
+
+```bash
+anet node create my-lead --runtime claude-code-cli
+```
+
+输出（实测 anet v2.2.7-preview.1）：
+
+```
+[anet] 请确保已安装 Claude Code CLI 并登录: claude auth login
+
+[anet] Created node "my-lead" (claude-code-cli) in network "default"
+[anet] Network token assigned (node-level)
+[anet] claude-code-cli requires:
+  - Claude Pro / Team / Enterprise subscription
+  - Run "claude auth login" first
+  - Uses Anthropic Claude only
+  - For other models, use --runtime codex-sdk or claude-agent-sdk
+```
+
+关键信息：**只能用 Anthropic Claude，不能通过这条 Runtime 切 OpenAI 或国产模型**。想切模型必须换 Runtime。
+
+### 2.3 `config.json` 专属字段
+
+`claude-code-cli` 节点的 config 有两个其他 Runtime 没有的字段：
+
+| 字段 | 含义 |
+|---|---|
+| `teammateMode: "in-process"` | **Claude Code 内部概念**（非 anet 自定义），让 Claude Code 以 Agent 模式运行而不是交互式助手。缺少这个字段节点启动后会停在等待用户输入。不要手动改值。 |
+| `session` | 绑定的 Claude Code session ID。`anet node start` 默认 resume 上次 session（上下文保留），要强制新建用 `--new-session`。 |
+
+`model` 字段**不存在**——claude-code-cli 的模型由 Claude Pro/Team 订阅账号控制，anet 不注入也不干预。与之对比：`claude-agent-sdk` 和 `codex-sdk` 的模型由 config 的 `model` 字段决定，anet 直接传给进程。
+
+三种 Runtime 的 `flags` 差异速览：
+
+| flag | cc-cli | agent-sdk | codex |
+|---|---|---|---|
+| `dangerouslySkipPermissions` | 有 | 有 | 有 |
+| `teammateMode` | 有（必填） | 无 | 无 |
+| `approvalPolicy` | 无 | 无 | 有（`"never"`） |
+| `sandboxMode` | 无 | 无 | 有（`"danger-full-access"`） |
+| `skipGitRepoCheck` | 无 | 无 | 有（`true`） |
+
+### 2.4 稳定性现状
+
+**未自动化回归。** 当前版本（anet v0.10.8）`claude-code-cli` Runtime 没有独立的 Docker E2E CI 覆盖——原因是 Claude Code CLI 涉及真实订阅账号、OAuth 状态，难以在 CI 环境中复现。
+
+v0.8.2 修了一个在这条路径上踩到的 bug：`session resume` 默认丢失。症状是节点重启后明明有旧 session 但依然起了个新 session，上下文清空。修完后 `anet node start` 默认 resume 行为稳定，但整条路径的自动化回归覆盖依然是空白。
+
+实际含义：这条 Runtime 在人肉测试和日常使用中没问题，但如果某个 anet 更新悄悄引入了回归，没有 CI 会在第一时间报警——你是最先发现的那个人。
+
+### 2.5 适用场景
+
+- 个人用户已有 Claude Pro/Team/Max 订阅，工具链成本接近零
+- 需要 Claude Code 的完整内置工具集（WebFetch / WebSearch / Bash / Read / Write / Edit / Glob / Grep / Task / ...）
+- 想用 Claude 的内置 plugin 系统（如 Telegram channel via `telegram@claude-plugins-official`）
+- 本地单人高速迭代，不需要多 Provider 切换
+
+---
+
+## 3. `claude-agent-sdk` — 最稳的主力底座
+
+### 3.1 底层是什么
+
+`claude-agent-sdk` Runtime 使用 `agent-node`（`@sleep2agi/agent-node` 包）作为执行引擎，底层调用 `@anthropic-ai/claude-agent-sdk`。这是一个轻量 Node.js 进程，不依赖 Claude Code CLI，不需要订阅账号，通过 API key 直接对话 LLM。
+
+```
+anet node start 写作兵
+    ↓
+spawn: agent-node <config.json>
+    ↓
+agent-node 读 config、连 Hub SSE、按 vendor preset 配置 LLM client
+    ↓
+收到任务 → 调 @anthropic-ai/claude-agent-sdk → 工具调用循环 → MCP 回复
+```
+
+实测 `anet -v` 里的组件版本（2026-05-21 本机）：
+
+```
+Components:
+  ✓ agent-node v2.4.2
+    └ @anthropic-ai/claude-agent-sdk v0.2.141
+```
+
+`agent-node`（`@sleep2agi/agent-node`）是 anet **自研**的 Agent 执行器进程，`@anthropic-ai/claude-agent-sdk` 是 **Anthropic 官方**的低级 SDK（与 Claude Code 无关）。注意：Runtime 名 `claude-agent-sdk` 指这条执行路径，并不等于 npm 包名 `@anthropic-ai/claude-agent-sdk`——前者是 anet 的分类标签，后者是底层依赖。两者一起打包在 `agent-node` 里，anet 按需 spawn。
+
+### 3.2 实测创建输出
+
+```bash
+anet node create my-writer --runtime claude-agent-sdk
+```
+
+输出（实测）：
+
+```
+[anet] Created node "my-writer" (claude-agent-sdk) in network "default"
+[anet] Network token assigned (node-level)
+
+[anet] ⚠ Node created with default tool set:
+[anet]    Built-in: all (Claude Code preset — WebFetch / WebSearch / Bash / Read / Write / Edit / Glob / Grep / Task / ...)
+[anet]    MCP:      mcp__commhub__send_task / send_message / send_reply / get_all_status / ...
+[anet]    Flags:    dangerouslySkipPermissions=true (no per-call confirmation), teammateMode enabled
+```
+
+相比 `claude-code-cli`，没有"需要 Claude Pro 订阅"的提示——因为这条路走 API key，不走订阅。
+
+### 3.3 `config.json` 专属字段
+
+与 `claude-code-cli` 的核心差异：
+
+- **没有 `teammateMode` 字段**：`agent-node` 本身以 Agent 模式设计，不需要这个 Claude Code 内部 flag
+- **没有 `session` 字段**：`claude-agent-sdk` 没有独立 session 概念，重启不会丢上下文绑定
+- **flags 最简洁**：只有 `dangerouslySkipPermissions`（对比 §2.3 flags 表）
+
+指定 `--model` 时会出现 `model` 字段（`claude-agent-sdk` 的默认 model 是 `claude-sonnet-4-6`，源自 vendor preset）：
+
+```bash
+anet node create my-writer --runtime claude-agent-sdk --model claude-opus-4-6
+```
+
+不指定时默认使用 vendor preset 的默认 model。`claude-code-cli` 的 `model` 字段则被忽略——那条路的模型由订阅账号控制。
+
+### 3.4 稳定性现状（最稳）
+
+**这是三者中唯一有 Docker E2E 全链路 CI 覆盖的 Runtime。**
+
+Docker E2E 的含义：用 Docker compose 在 CI 环境里跑完整链路——真实的 agent-node 进程启动 → 真实的 LLM API 调用 → MCP 工具往返到真实的 CommHub → 任务完成并回复。不是 mock、不是单元测试里的 stub。因为 agent-node 走 API key 而不是 OAuth，CI 可以从环境变量注入 key，从而实现完全无人值守的全链路跑通。
+
+当前有 Docker E2E 覆盖的 vendor 组合（来自 anet README 实测状态部分）：
+
+| Vendor | Provider | E2E 覆盖状态 |
+|---|---|---|
+| 书生 Intern | 上海 AI Lab | 已覆盖 |
+| MiniMax | MiniMax API | 已覆盖 |
+| （其他 vendor） | 各 Provider | 可选但未做全链路 E2E |
+
+"已覆盖"的意思是：anet CI 管道里有对应的 Docker compose 测试用例，每次发版都跑，不通过不发布。这直接影响你踩回归的概率。具体覆盖哪几个 vendor、CI 管道结构会随版本演进，以 [anet.sh/guide/runtimes](https://anet.sh/guide/runtimes) 官方文档为准。
+
+### 3.5 Telegram channel 的特殊行为
+
+`claude-agent-sdk` Runtime 的节点走 **agent-node 内置 Telegram long-polling**，不需要装 `telegram@claude-plugins-official` plugin。
+
+启动有 Telegram channel 的节点时，日志里会出现：
+
+```
+[HH:MM:SS] [INFO ] [写作兵] Telegram bot: @your_bot_username (Bot Name)
+[HH:MM:SS] [INFO ] [写作兵] Telegram polling: /path/to/.anet/nodes/写作兵/channels/telegram
+```
+
+看到这两行说明 token 有效、polling 已启动。完整 Telegram 配置流程见 CH2 L04。
+
+### 3.6 适用场景
+
+- 需要精确控成本、按 token 付费（搭配 MiniMax / 书生 / Kimi 等国产 Provider）
+- 需要主力生产 Agent，要最稳定的执行路径
+- 不想依赖 Claude Pro 订阅，或者团队有专用 API key 预算
+- Docker 编队场景（`demos/codex-telegram-squad` 就是这条路）
+
+---
+
+## 4. `codex-sdk` — OpenAI 生态的接入口
+
+### 4.1 底层是什么
+
+`codex-sdk` Runtime 同样使用 `agent-node`（和 `claude-agent-sdk` 一样），但底层调用 **Codex CLI**（`codex` 命令）作为 LLM 执行层，而不是 `@anthropic-ai/claude-agent-sdk`。
+
+```
+anet node start 代码兵
+    ↓
+spawn: agent-node <config.json>
+    ↓
+agent-node 调 codex CLI 作为 LLM backend
+    ↓
+收到任务 → Codex 进程跑 LLM 调用 → 工具调用循环 → MCP 回复
+```
+
+`codex-sdk` 的关键特征：**这条路走 OpenAI 账号（OAuth 流程，`codex auth login`）**，不是 API key。
+
+### 4.2 实测创建输出
+
+```bash
+anet node create my-coder --runtime codex-sdk
+```
+
+输出（实测）：
+
+```
+[anet] 请确保已执行: codex auth login
+
+[anet] Created node "my-coder" (codex-sdk) in network "default"
+[anet] Network token assigned (node-level)
+```
+
+必须提前跑 `codex auth login` 做 OAuth——这是 codex-sdk 的先决条件，也是其"真实 OAuth 未上 CI"的根本原因（下面展开）。
+
+### 4.3 `config.json` 字段
+
+```json
+{
+  "anet_version": "0.1.0",
+  "node_id": "n_6ba69ba5",
+  "node_name": "my-coder",
+  "runtime": "codex-sdk",
+  "hub": "http://127.0.0.1:9200",
+  "token": "ntok_...",
+  "model": "gpt-5.5",
+  "channels": ["server:commhub"],
+  "env": {},
+  "flags": {
+    "dangerouslySkipPermissions": true,
+    "approvalPolicy": "never",
+    "sandboxMode": "danger-full-access",
+    "skipGitRepoCheck": true
+  }
+}
+```
+
+和另外两个 Runtime 相比，`codex-sdk` 的 `flags` 最多：
+
+| Flag | 含义 | 是否 codex-sdk 专属 |
+|---|---|---|
+| `dangerouslySkipPermissions` | 跳过所有工具调用确认 | 三者都有 |
+| `approvalPolicy: "never"` | codex CLI 的审批策略：never = 全自动，不弹确认 | codex-sdk 专属 |
+| `sandboxMode: "danger-full-access"` | 不启用 codex 沙箱，Agent 直接访问文件系统 | codex-sdk 专属 |
+| `skipGitRepoCheck: true` | 跳过 git repo 检查，允许在任意目录跑 | codex-sdk 专属 |
+
+`model` 字段默认值是 `gpt-5.5`（实测，2026-05-21）。可以在 `anet node create` 时用 `--model` 指定，或者直接编辑 `config.json` 的 `model` 字段再重启节点。
+
+### 4.4 稳定性现状
+
+**单元测试通过，但真实 OAuth 流程未上 CI。**
+
+原因很直接：`codex auth login` 是 OAuth 流程，需要真实的 OpenAI 账号做授权，没有办法在无头 CI 环境里跑完整的 OAuth（浏览器弹窗 → 用户登录 → 拿 token）。CI 里能覆盖的是 anet 侧的单元测试（config 解析、flag 传递等），但真实 LLM 调用 + MCP 往返这条链路没有自动化。
+
+实际含义：如果 codex CLI 的 OAuth token 过期，或者 anet 的某次更新影响了 codex runtime 的 spawn 逻辑，没有 CI 会第一时间捕获，你会在实际使用时踩到。
+
+另一个坑：OAuth token 有过期时间（具体周期超出 anet 域、以 codex 官方文档为准）。节点长期运行时会遇到 token 自动失效、节点下线但 `anet node ls` 依然显示上线的情况。此时需要手动重跑 `codex auth login` 再重启节点。
+
+实测安装的 codex 版本（本机 2026-05-21）：
+
+```
+✓ codex CLI v0.130.0
+```
+
+### 4.5 Telegram channel 的行为
+
+三种 Runtime 的 Telegram 实现一张表对比：
+
+| Runtime | 实现方式 | 需要装 claude plugin？ |
+|---|---|---|
+| `claude-code-cli` | Claude Code 内置 plugin（`--channels plugin:telegram@claude-plugins-official`） | 是 |
+| `claude-agent-sdk` | agent-node 内置 long-polling | 否 |
+| `codex-sdk` | agent-node 内置 long-polling | 否 |
+
+`codex-sdk` 启动日志和行为与 `claude-agent-sdk` 节点完全一致（见 §3.5）。
+
+### 4.6 适用场景
+
+- 团队主力用 OpenAI 账号，不想额外维护 API key 账单
+- 需要 GPT 系模型特有的能力（如 gpt-5.5 在某些代码场景的表现）
+- 实验性测试，不是主力生产路径（考虑 OAuth 未上 CI 的风险）
+- 与 codex CLI 生态有其他集成点
+
+---
+
+## 5. 三者核心差异对比
+
+| | cc-cli | agent-sdk | codex |
+|---|---|---|---|
+| 执行引擎 | claude CLI | agent-node | agent-node |
+| LLM 接入方式 | Claude 订阅账号 | API key | OAuth (codex auth) |
+| 可切换 Provider | 否（只 Anthropic） | 是（7 个 vendor） | 否（只 OpenAI/GPT 系） |
+| Docker E2E CI | 无 | 有（Intern/MiniMax） | 无（OAuth 未上 CI） |
+| 自动化回归覆盖 | 未覆盖 | 已覆盖 | 单元测试覆盖，E2E 未 |
+| Telegram 实现 | claude plugin | agent-node 内置 | agent-node 内置 |
+| session 机制 | Claude session | 无独立 session | 无独立 session |
+| 专属 flags | `teammateMode` | （最少） | `approvalPolicy` / `sandboxMode` |
+| 稳定性等级 | 生产可用，无 E2E | 最稳，有 E2E | 生产可用，OAuth 需维护 |
+| 前置条件 | `claude auth login` | API key | `codex auth login` |
+
+**稳定性等级说明**：这里的"稳定性"特指**自动化 CI 回归覆盖**，不是主观质量评分。三条路在当前版本（anet v0.10.8）日常使用都没问题；区别在于——当某次 anet 更新悄悄引入回归时，`claude-agent-sdk` 上的 Docker E2E 会在 **0 分钟内**（CI 不过不发布）捕获；另外两条路没有这道闸，**你是第一个发现问题的人**，等你发现时已经在生产里跑了一段时间。
+
+---
+
+## 6. 同一个 Hub 上混搭三种 Runtime
+
+anet 的设计没有限制单个 Hub 只能跑一种 Runtime。你的 Agent 军团可以是：
+
+```bash
+# 指挥官用 claude-code-cli（已有 Claude Pro，成本零）
+anet node create 指挥官 --runtime claude-code-cli
+
+# 写作兵用 claude-agent-sdk + MiniMax（低成本，高产出）
+anet node create 写作兵 --runtime claude-agent-sdk --model minimax  # vendor preset 自动选默认 model
+
+# 代码兵用 codex-sdk（团队有 OpenAI 账号）
+anet node create 代码兵 --runtime codex-sdk
+
+# 同时运行（不同 tmux 窗口）
+anet node start 指挥官 --tmux
+anet node start 写作兵 --tmux
+anet node start 代码兵 --tmux
+```
+
+`anet node ls` 显示三列 RUNTIME 各不相同，但 Hub 侧看不到区别——统一通过 `server:commhub` SSE 连接。
+
+**混搭的注意事项**：
+
+**工具调用行为不完全一致**。三种 Runtime 底层的 LLM 调用路径不同，同一段提示词给 cc-cli 和 codex 跑，工具调用序列可能有差异（尤其是并发 tool_use 的处理）。在同一个 Mesh 任务链路里混搭 Runtime 时，如果某个节点的回复格式跟预期不一样，先检查是不是 Runtime 差异导致的（→ 详见 CH3 L03：回复格式与 tool_use 序列差异）。
+
+**不要让 claude-code-cli 节点和 codex-sdk 节点共用一个 bot token**。两条 Runtime 的 Telegram polling 都是在节点进程内跑，共用 token 会互抢 Telegram 消息（每条消息只被一个 polling 进程取走），行为不可预期。每个节点独立 bot token。
+
+**claude-code-cli 节点的重启成本更高**。重启时 anet 要重新 spawn `claude` 进程并 resume session，session 状态同步需要几秒到十几秒。`claude-agent-sdk` 和 `codex-sdk` 节点因为没有独立 session，重启更快。多节点批量重启（`anet project restart`）时，如果有 claude-code-cli 节点，`--stagger` 参数要适当调大（建议 5 秒以上）。
+
+---
+
+## 7. 选型速查：4 个问题定位你的场景
+
+**Q1: 你有 Claude Pro/Team/Max 订阅吗？**
+
+→ 有：`claude-code-cli` 可以，成本最低（边际零增量）。但如果需要精确控成本或跨 Provider，往下看。
+→ 没有：跳过 `claude-code-cli`。
+
+**Q2: 这个 Agent 是主力生产节点，还是实验性的？**
+
+→ 主力生产（会长期跑、会出问题时被 blame）：选 `claude-agent-sdk`，唯一有 Docker E2E 覆盖、回归 0 分钟发现的。
+→ 实验性 / 个人探索：三者都行，风险自担。
+
+**Q3: 你的团队主力用哪个 LLM 生态？**
+
+→ Anthropic 兼容（Anthropic 官方 / MiniMax / 书生 / Kimi / DeepSeek / GLM 等）：选 `claude-agent-sdk`，7 个 vendor preset 开箱即用。
+→ OpenAI 账号（OAuth，不是 API key）：选 `codex-sdk`。
+
+**Q4: 你有国产 Provider API key，需要精确控成本吗？**
+
+→ 是：`claude-agent-sdk` + MiniMax/书生。国内直连，低成本，有 E2E 验证。
+
+---
+
+**一张快查表**：
+
+| 你的情况 | 推荐 Runtime |
+|---|---|
+| Claude Pro 订阅，单人高速迭代 | `claude-code-cli` |
+| 需要最稳定的主力 Agent | `claude-agent-sdk` |
+| 国产模型 / 精确控成本 | `claude-agent-sdk` + MiniMax / 书生 |
+| 团队用 OpenAI 账号 | `codex-sdk` |
+| Docker 编队 / 需要多 vendor 切换 | `claude-agent-sdk` |
+| 不确定 | `claude-agent-sdk`（最稳） |
+
+---
+
+## 8. 切换和修改
+
+### 8.1 修改已有节点的 Runtime
+
+**不支持 `anet node update --runtime`**（实测没有这个命令）。改 Runtime 的方法是：
+
+```bash
+# 方法 A：删了重建（推荐，干净）
+anet node delete 写作兵 --force
+anet node create 写作兵 --runtime claude-agent-sdk
+
+# 方法 B：直接编辑 config.json（有风险，可能有字段不一致）
+# 不推荐：不同 Runtime 的 flags 结构不同，手改容易漏
+```
+
+方法 A 会丢失 session 绑定，但 claude-agent-sdk/codex-sdk 本来就没有独立 session，影响不大。claude-code-cli 节点删了重建会丢 session 绑定，claude 的 session 文件还在 `~/.claude/` 里，可以用 `anet node create --resume <session-id>` 重新绑。
+
+### 8.2 修改 model
+
+```bash
+# 创建时指定
+anet node create 写作兵 --runtime claude-agent-sdk --model claude-opus-4-6
+
+# 创建后改（直接编辑 config.json + 重启节点）
+# 编辑 .anet/nodes/写作兵/config.json 的 "model" 字段
+anet node stop 写作兵
+anet node start 写作兵
+```
+
+**claude-code-cli Runtime 的 `model` 字段会被忽略**——claude-code-cli 的 model 由订阅账号控制，anet 传不进去。想用特定 claude model，在 Claude Code 设置里改，不在 anet config 里改。
+
+### 8.3 查看当前所有节点的 Runtime
+
+```bash
+anet node ls
+```
+
+RUNTIME 列直接显示。不需要逐个 `anet info`。
+
+---
+
+## 总结
+
+本节建立了三种 Runtime 的完整认知框架：
+
+1. **`claude-code-cli`**：底层是 `claude` CLI，走 Claude 订阅，工具链最完整，但无 Docker E2E 回归覆盖；Telegram 走 claude plugin；session 机制独立，重启稍慢
+2. **`claude-agent-sdk`**：底层是 `agent-node` + Anthropic SDK，走 API key，7 个 vendor preset，唯一有 Docker E2E 覆盖的 Runtime，最稳；Telegram 走 agent-node 内置 long-polling
+3. **`codex-sdk`**：底层是 `agent-node` + codex CLI，走 OpenAI OAuth（不是 API key），单元测试覆盖但真实 OAuth 未上 CI，OAuth token 有过期问题；Telegram 同 claude-agent-sdk 走内置 long-polling
+
+三者可在同一 Hub 上混搭，Hub 看不到 Runtime 差异，统一走 SSE + MCP。混搭的核心注意点：工具调用行为略有差异、bot token 不能共用、claude-code-cli 节点重启成本更高。
+
+选型原则：新建主力生产 Agent 默认选 `claude-agent-sdk`——Docker E2E 覆盖意味着回归 0 分钟发现，另外两条路需要你自己发现（通常在生产里跑了一段时间之后）；有 Claude Pro 且不需要多 Provider 的用 `claude-code-cli`；团队绑定 OpenAI OAuth 的用 `codex-sdk`。
+
+下一节（CH3 L02）展开 8 家 Provider 的切换与成本混搭——`claude-agent-sdk` 的 7 个 vendor preset 每个都怎么配、`ANTHROPIC_BASE_URL` 一行切换的原理、以及哪些 Provider 在 tool_use 场景里会翻车。
+
+---
+
+## 附录：本节命令速查
+
+```bash
+# 创建三种 Runtime 的节点
+anet node create <name> --runtime claude-code-cli
+anet node create <name> --runtime claude-agent-sdk
+anet node create <name> --runtime codex-sdk
+
+# 指定 model（claude-code-cli 忽略此参数）
+anet node create <name> --runtime claude-agent-sdk --model claude-opus-4-6
+anet node create <name> --runtime codex-sdk --model o3
+
+# 查所有节点的 Runtime
+anet node ls
+
+# 查单个节点详情（含 runtime / flags / model）
+anet info <name>
+
+# 重启节点（修改 config.json 后需要重启生效）
+anet node stop <name>
+anet node start <name>
+
+# 强制新建 session（claude-code-cli 专用）
+anet node start <name> --new-session
+
+# 删除节点（改 runtime 必须删了重建）
+anet node delete <name> --force
+
+# 恢复 claude-code-cli 节点的旧 session（删了重建后用）
+anet node create <name> --runtime claude-code-cli --resume <session-id>
+
+# 查看 anet 组件版本（含 agent-node / claude-agent-sdk 版本）
+anet -v
+
+# 查 commhub-server 版本（/health 端点返回的 version 字段）
+curl -s http://127.0.0.1:9200/health | python3 -m json.tool | grep version
+```
+
+> **版本说明**：本节基于 anet v0.10.8（产品发布版）实测，CLI 包 `@sleep2agi/agent-network` 版本为 `v2.2.7-preview.1`（`anet -v` 输出，以你实际装到的为准），`agent-node v2.4.2`，`claude CLI v2.1.146`，`codex CLI v0.130.0`。Runtime 的 CI 覆盖状态随版本演进可能调整，以 [anet.sh/guide/runtimes](https://anet.sh/guide/runtimes) 为准。

@@ -1,0 +1,418 @@
+---
+title: "tool_use 不兼容时怎么降级 — 多 Agent 最大的坑"
+order: 3
+estimated_minutes: 16
+---
+
+# tool_use 不兼容时怎么降级 — 多 Agent 最大的坑
+
+> 你的 Agent 军团跑起来了，但有几个节点一直不回复。日志显示 LLM 收到了任务，却返回了一大段文字——没有调 `send_reply`，没有调 `report_status`，什么都没有。这是 tool_use 兼容性问题，多 Agent 调试里最耗时的一类。
+
+## 0. 一句话先讲明白
+
+**anet 的 Agent 通信完全依赖 tool_use——每一个 `send_task` / `commhub_reply` / `report_status` 都是一次工具调用。Provider 不调工具，整条通信链就断了。不同 Provider 的 tool_use 实现质量差距很大，主力 Agent 要 stick 在 Anthropic 兼容档。**
+
+---
+
+## 你将学到
+
+- 为什么 anet 的多 Agent 通信强依赖 tool_use，以及这和单 Agent 场景有什么本质区别
+- tool_use 在不同 Provider 上的三种失效模式（拒绝调用 / 参数畸变 / parallel 行为差异）
+- 跨 Provider tool_use 兼容矩阵：哪家稳、哪家有坑、哪些数据需要自行实测
+- 降级策略的两个层次：system prompt 加固 / 任务路由分级
+- 用 `anet logs` + SQLite 快速判断是 tool_use 问题还是其他问题
+
+## 适合谁
+
+已完成 CH3 L02（理解 8 家 Provider 的切换原理），现在遇到了某个 Provider 的 Agent 节点不回复的工程师。L02 讲"怎么切"，本节讲"切过去之后如果工具不工作怎么办"。
+
+---
+
+## 1. 为什么多 Agent 场景对 tool_use 的依赖远超单 Agent
+
+本课引言（CH0 L01）里提到过一个数字：约 60% 的多 Agent debug 时间耗在 tool_use 兼容性问题上。这不是夸张——当你读完本节，会理解为什么这个比例这么高。
+
+单 Agent 场景里，tool_use 失败的代价是有限的：LLM 不调工具，最多是某个子任务没执行，用户看到一段文字输出，发现了重新试。
+
+多 Agent 场景的依赖结构完全不同。
+
+### 1.1 通信本身就是 tool_use
+
+anet 里每一次 Agent 间通信都走 MCP 工具调用：
+
+```
+Agent 收到任务
+  ↓
+LLM 思考，决定调 report_status（"我收到了，开始处理"）
+  ↓
+LLM 执行任务，决定调 commhub_reply（"完成，结果如下…"）
+  ↓
+Hub 把 reply 路由给发件方
+```
+
+如果 LLM 在任何一步没有触发工具调用——改成直接输出文字——整条链就断在那里：Hub 收不到 `report_status`，发件方收不到 `commhub_reply`，任务在 TTL 到期后变成 `expired`。
+
+这不是 bug，是 Mesh 编排的结构性风险：**通信协议就是工具调用本身。** 单 Agent 场景可以容忍 LLM 偶尔不调工具，多 Agent 场景不行。
+
+### 1.2 失败在链路上游，症状在下游
+
+更麻烦的是，tool_use 失败在 Provider 侧静默发生。你在 Hub 侧能看到的是：任务 `expired`，或者任务一直 `running` 没有 `replied`。要往上追才能发现是 LLM 在 Agent 日志里输出了一段文字而没有调工具。
+
+这就是为什么 tool_use 兼容性问题容易被误判——症状（任务没完成）和根因（LLM 没调工具）之间隔了好几层。
+
+---
+
+## 2. tool_use 的三种失效模式
+
+观察多 Provider 实测行为，tool_use 失效主要有三种模式。
+
+### 2.1 模式一：拒绝调用，直接输出文字
+
+最常见的失效模式。LLM 收到了任务内容和工具定义，但选择用自然语言回答而不是调工具：
+
+```
+# 期望行为（正常 Anthropic 模型）
+LLM response: tool_use → commhub_reply
+  id: toolu_01abc...
+  input: { "task_id": "...", "content": "完成，分析结果如下：..." }
+
+# 实际行为（部分 Provider 在某些 prompt 下）
+LLM response: text
+  "好的，我已经分析完成了。结果是..."
+```
+
+从 Hub 视角看，这个 Agent 的任务永远停在 `running` 或超时 `expired`，日志里能看到模型的文字输出，但没有 MCP 工具调用记录。
+
+**常见触发条件**：
+- 任务描述太像"聊天"而非"指令"（LLM 觉得该聊天，不该调工具）
+- Provider 的工具调用倾向比 Anthropic 保守（某些模型只在有明确 "use the tool" 类指示时才调）
+- system prompt 没有明确要求必须用工具回复，LLM 自主选择了更"自然"的方式
+
+据社区反馈，DeepSeek 这类走 `custom` + `ANTHROPIC_BASE_URL` 接入的 Provider 在对话风格任务下这个问题更明显；指令性强的 prompt 成功率更高。这不是 anet E2E 测出的结论，是社区经验汇总，具体行为以你实测为准。
+
+### 2.2 模式二：调了工具，但参数畸变
+
+LLM 触发了工具调用，但参数不符合 schema：
+
+```json
+// 正确调用
+{
+  "name": "send_task",
+  "input": {
+    "to": "worker-b",
+    "task": "分析这段代码的安全风险：...",
+    "ttl_seconds": 3600
+  }
+}
+
+// 畸变调用（实际见过的变体）
+{
+  "name": "send_task",
+  "input": {
+    "to": "worker-b",
+    "task": "分析这段代码的安全风险：...",
+    "ttl_seconds": "3600"   // string 而非 integer
+  }
+}
+
+// 或者参数名写错
+{
+  "name": "send_task",
+  "input": {
+    "target": "worker-b",  // 'to' 写成了 'target'
+    "content": "..."       // 'task' 写成了 'content'
+  }
+}
+```
+
+Hub 的 MCP 服务器端会做 schema 校验，参数错误会返回错误响应，Agent 有时会重试（生成一个更正的调用），有时会放弃并输出文字。结果是任务要么最终成功（Agent 自己修正了），要么失败得更隐蔽（有工具调用记录但参数无效）。
+
+### 2.3 模式三：parallel_tool_calls 行为差异
+
+**什么是 parallel_tool_calls**：Anthropic API 的一个 feature——LLM 的单次响应可以包含多个 `tool_use` block，而不是只返回一个然后等结果再返回下一个。这让协调节点可以在一次 LLM 调用里同时向三个 worker 发 `send_task`，实现真正的并行派活。
+
+anet 的某些场景依赖这个能力（比如辩论 demo 的并行发言、PR Review 的多 reviewer 同时开工）。不同 Provider 的实现差距很大。
+
+**示例：期望 vs 实际**
+
+```
+# 期望：一次响应三个 tool_use block（Anthropic 原生行为）
+LLM response [单次]:
+  tool_use → send_task  to="reviewer-security"  task="..."
+  tool_use → send_task  to="reviewer-perf"      task="..."
+  tool_use → send_task  to="reviewer-arch"       task="..."
+
+# 实际（部分 Provider）：一次只返回一个，串行
+Turn 1:  tool_use → send_task  to="reviewer-security"
+Turn 2:  tool_use → send_task  to="reviewer-perf"
+Turn 3:  tool_use → send_task  to="reviewer-arch"
+```
+
+部分 Provider 的行为不同：
+
+- 只允许单次工具调用，多工具场景返回第一个工具调用然后停止
+- 支持多工具但严格按顺序返回，不并行
+- 支持并行但在某些 prompt 长度下退化为串行
+
+实际影响：并行派活退化为串行，3 个 reviewer 同时开工变成 3 个 reviewer 顺序开工，耗时翻倍但不会彻底失败——这种失效模式最难发现，因为结果还是对的，只是慢了。
+
+---
+
+## 3. 跨 Provider tool_use 兼容矩阵
+
+下表基于 anet Docker E2E 覆盖（通过 claude-agent-sdk runtime）和 anet 源码中的 VENDORS 注释整理。
+
+**重要说明**：Provider 兼容性是时效性极强的信息，每次 Provider 发布新模型版本，行为可能变化。矩阵里 parallel_tool_calls / schema 严格度等格子属于 provider 侧 API 行为，anet E2E 只验"全链路跑通"、不产出各家详细参数，需以各家官方文档或自行实测为准，不要硬信这张表做生产决策。
+
+| Provider | tool_use 单次调用 | parallel_tool_calls | 参数 schema 严格度 | 多 Agent 推荐度 | 备注 |
+|---|---|---|---|---|---|
+| Anthropic（claude-sonnet-4-6 / claude-opus-4-6 / claude-haiku-4-5）| 原生，满分 | 原生支持 | 高 | 首选 | anet E2E 基准 Provider |
+| GLM（智谱 AI）| 高 | provider 侧 API 行为，见各家官方文档 / 自行实测 | provider 侧 API 行为，见各家官方文档 / 自行实测 | 备选 | anet docs 标注接近 Anthropic 兼容 |
+| Kimi（月之暗面）| 高 | provider 侧 API 行为，见各家官方文档 / 自行实测 | provider 侧 API 行为，见各家官方文档 / 自行实测 | 备选 | anet docs 标注接近 Anthropic 兼容 |
+| DeepSeek | 中，据社区反馈偶发拒绝调用 | provider 侧 API 行为，见各家官方文档 / 自行实测 | 中 | 慎用为主力 | 走 `custom` 接入，无 anet E2E 记录；纯生成任务（无需工具回复）可用 |
+| MiniMax | Docker E2E 验证过 MCP 往返（含 send_task / commhub_reply）| provider 侧 API 行为，见各家官方文档 / 自行实测 | provider 侧 API 行为，见各家官方文档 / 自行实测 | 备选，先验证 | anet debate demo 以 MiniMax 为主力跑通 |
+| 书生（InternLM）| Docker E2E 验证过 MCP 往返（含 send_task / commhub_reply）| provider 侧 API 行为，见各家官方文档 / 自行实测 | provider 侧 API 行为，见各家官方文档 / 自行实测 | 备选，先验证 | intern-s2-preview 经 real-call 验证（2026-05-14）|
+| OpenAI（via codex-sdk / Codex CLI OAuth）| 中，runtime 不同于 claude-agent-sdk | 原生支持，行为略异 | 高 | 慎用，可用于辅助节点 | codex-sdk runtime 走 `codex auth login`，不走 `ANTHROPIC_BASE_URL`；模型 gpt-5.5 / o3 |
+| OpenRouter（聚合）| 取决于路由到的底层模型 | 取决于底层模型 | 取决于底层模型 | 不可预期 | 主力 Agent 不推荐，辅助节点可以用已知稳定的路由 |
+
+**关于 DeepSeek**：DeepSeek 在 anet 走 `custom` vendor，通过 `ANTHROPIC_BASE_URL` 直连（DeepSeek 提供原生的 `/anthropic` 兼容端点，直接路径，不需要额外翻译层）。据社区反馈，指令性强、带有明确"调用工具"语气的 prompt 成功率更高；对话风格的任务描述成功率下降。anet 没有 DeepSeek 的官方 E2E 记录，上述为社区经验，以自行实测为准。
+
+**矩阵读法**："provider 侧 API 行为，见各家官方文档 / 自行实测"表示该格子是 provider 自身的 API 规格，anet E2E 不覆盖这个维度。用 §5.3 的最小化验证跑一遍比信任这张表更可靠。
+
+---
+
+## 4. 降级策略：两个层次
+
+遇到 tool_use 兼容问题，优先从轻到重处理。
+
+### 4.1 第一层：system prompt 加固
+
+成本最低，先试。在节点的 system prompt 里明确要求 LLM 必须用工具回复，不允许纯文字：
+
+```
+你是一个 AI Agent 节点，运行在 anet 多 Agent 系统中。
+
+关键规则（必须严格遵守）：
+1. 收到任务后，第一步必须调用 report_status 确认收到
+2. 任务完成后，必须调用 commhub_reply 返回结果，不能只输出文字
+3. 需要向其他 Agent 派活时，调用 send_task，to 参数填目标节点的 alias 名称（不是 task_id）
+4. 禁止在 commhub_reply 之外用自然语言直接描述任务结果
+
+违反上述规则的回复等于任务失败。
+```
+
+这对据社区反馈有拒绝调用倾向的 Provider（DeepSeek、某些 GLM/Kimi 版本）效果明显。Anthropic 模型本身就不需要这些约束，但加上也无害。
+
+**加固 prompt 的一个常见误区**：说"你需要调用工具"效果不如说"调用 report_status 是你唯一合法的确认方式，输出文字确认无效"。后者给模型一个明确的完成标准，而不是一个建议。
+
+### 4.2 第二层：任务路由分级（主力 + 辅助分工）
+
+这是 anet 多 Provider 场景里最实用的架构模式：
+
+```
+主力 Agent（Anthropic / GLM / Kimi）
+  ├─ 接受外部任务
+  ├─ 任务拆解、协调、结果汇总
+  └─ 调用 send_task 向辅助节点派活
+        ↓
+辅助 Agent（DeepSeek / 书生 / 其他）
+  ├─ 接受主力分配的子任务（纯生成类）
+  └─ 结果直接返回给主力（主力再用 commhub_reply 汇总）
+```
+
+辅助节点承担的是不需要主动发起工具调用的任务：写代码、翻译、总结、分析文本。主力节点负责所有需要 tool_use 的通信动作。
+
+这个分工的好处是：即使辅助节点的 tool_use 偶发失效，最多是一个子任务没完成，主力节点可以感知到（子任务 `expired`）并决定重试或降级处理，不会让整个多 Agent 协作崩掉。
+
+在 `anet node create` 时，可以给主力节点和辅助节点分配不同的 Provider：
+
+```bash
+# 创建主力节点，选 Anthropic
+anet node create orchestrator
+# → 选 runtime: claude-agent-sdk
+# → 选 provider: Anthropic
+# → 填 ANTHROPIC_API_KEY
+
+# 创建辅助节点，选 DeepSeek（便宜，适合批量生成任务）
+anet node create writer-a
+# → 选 runtime: claude-agent-sdk
+# → 选 provider: custom（DeepSeek 走 custom 接入）
+# → ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic（或 DeepSeek 当前兼容端点，以官方文档为准）
+# → 填 ANTHROPIC_AUTH_TOKEN=<你的 DeepSeek API key>
+```
+
+主力节点只用 Anthropic（或 GLM/Kimi），辅助节点自由选成本更低的 Provider。
+
+---
+
+## 5. 如何快速判断是不是 tool_use 问题
+
+遇到任务不完成，先排除掉"不是 tool_use 问题"的情况，再做针对性处理。
+
+### 5.1 第一步：看节点日志
+
+```bash
+anet logs <node-name>
+# 或者加 --follow 实时跟踪
+anet logs <node-name> --follow
+```
+
+**是 tool_use 问题的特征**：
+- 日志里有 LLM 的文字输出，但没有 `[tool_use]` 或工具调用相关的日志行
+- 日志里有工具调用记录，但 `commhub_reply` 或 `report_status` 缺失
+- 日志里有错误：`tool input validation failed` / `unknown tool` / 参数类型错误
+
+**不是 tool_use 问题的特征**：
+- 日志里有工具调用记录，`commhub_reply` 已调，但 Hub 返回错误 → 是 Hub 路由问题（见 CH2 L03）
+- 日志里有 API 请求错误（`401 Unauthorized` / `429 Rate limit` / `503 Service unavailable`）→ 是 Provider 连接问题，不是 tool_use 兼容问题
+- 日志空白，节点进程没有响应 → 是节点启动问题（见 CH1 L02）
+
+### 5.2 第二步：查 SQLite 任务状态
+
+```bash
+sqlite3 ~/.commhub/commhub.db
+```
+
+```sql
+-- 看目标节点最近的任务状态分布
+SELECT status, COUNT(*) as cnt
+FROM tasks
+WHERE to_name = '<node-alias>'
+GROUP BY status
+ORDER BY cnt DESC;
+```
+
+如果大量任务是 `expired`（而不是 `replied`），且节点日志显示 LLM 在工作，那就是 tool_use 问题。
+
+如果任务是 `running` 长时间没变化，看事件链（CH2 L03 §3 的事件链 SQL，即诊断 SQL [4]），最后一条事件是 `acked` 还是 `running`——是 `running` 说明 LLM 在跑但没调 `commhub_reply`，是 tool_use 问题。
+
+```sql
+-- 查具体任务的完整事件链（来自 CH2 L03 §3 诊断 SQL [4]）
+SELECT from_status, to_status, actor, detail, created_at
+FROM task_events
+WHERE task_id = 'YOUR-TASK-ID-HERE'
+ORDER BY created_at;
+```
+
+### 5.3 最小化验证：一个节点 + 一条任务
+
+如果你怀疑某个 Provider 配置的节点有 tool_use 问题，最快的验证是：
+
+1. 启一个该节点
+2. 在 Dashboard Chat 面板（`:3000` → Chat）直接给它发一条最简单的任务：`"你好，请用 commhub_reply 告诉我你收到了这条消息"`
+3. 看日志和 Dashboard Tasks 面板：是否有工具调用 + 是否有 `replied` 任务
+
+这个验证绕过了任务路由、多节点协作等变量，直接测 tool_use 是否工作。
+
+---
+
+## 6. 常见场景与处理方案
+
+### 场景 A：新加了一个 DeepSeek 节点，任务一直 expired
+
+**排查顺序**：
+1. `anet logs <node-name>` — 确认节点在线、LLM 在回复
+2. 看日志里有没有工具调用记录 — 如果没有，是 tool_use 拒绝调用
+3. 在 system prompt 里加强制要求（§4.1 的加固 prompt）
+4. 如果这个节点是协调节点（需要大量发 `send_task`），考虑换回 Anthropic 或 GLM/Kimi
+5. 如果是辅助节点（只接生成任务），评估是否接受"偶发失败 + 主力重试"的架构
+
+### 场景 B：替换 Provider 后节点不回复，逐步排查
+
+把一个节点从 Anthropic 换成其他 Provider（比如 DeepSeek / 书生）后如果不回复，按以下顺序排查：
+
+```bash
+# Step 1：确认节点进程在跑，日志有无 LLM 响应
+anet logs <node-name> --follow
+
+# Step 2：确认 API 端点连通（DeepSeek 为例，以实际 baseUrl 为准）
+curl -s "${ANTHROPIC_BASE_URL}/v1/models" \
+  -H "Authorization: Bearer ${ANTHROPIC_AUTH_TOKEN}" | head -c 200
+
+# Step 3：查最近 5 条发往该节点的任务，确认 status 分布
+sqlite3 ~/.commhub/commhub.db \
+  "SELECT task_id, status, created_at FROM tasks WHERE to_name='<node-alias>' ORDER BY created_at DESC LIMIT 5;"
+
+# Step 4：取一条 expired 任务的 task_id，查事件链，看最后停在哪个状态
+sqlite3 ~/.commhub/commhub.db \
+  "SELECT from_status, to_status, actor, detail, created_at
+   FROM task_events WHERE task_id='<task-id>' ORDER BY created_at;"
+```
+
+**根据事件链最后状态判断**：
+- 停在 `delivered`：节点 SSE 没连上，不是 tool_use 问题，是连接问题
+- 停在 `acked` / `running` 没有后续：LLM 在跑但没调工具，是 tool_use 拒绝调用（§4.1 加固 prompt）
+- 有 `replied` 但 Hub 报错：是 Hub 路由问题，不是 tool_use 问题（见 CH2 L03）
+
+### 场景 C：parallel_tool_calls 退化，并行变串行
+
+**症状**：协调节点同时向三个 worker 发 `send_task`，但 Dashboard 里任务的 `created_at` 是串行的（间隔几秒），不是同时出现。
+
+**原因**：该 Provider 不支持或不稳定支持 parallel_tool_calls，LLM 在一次响应里只发了一个工具调用，然后继续对话发第二个、第三个，变成串行。
+
+**处理**：
+- 如果可接受（只是慢，结果还是对的），不用处理
+- 如果严格要求并行（比如辩论 demo 的并行发言），协调节点换 Anthropic（原生 parallel_tool_calls 支持）
+
+---
+
+## 总结
+
+本节做了五件事：
+
+1. **解释了多 Agent 场景对 tool_use 的结构性依赖**——通信协议本身就是工具调用，失效不是"功能减少"而是"通信断路"；这也是为什么约 60% 的多 Agent debug 时间耗在这类问题上
+2. **梳理了三种失效模式**：拒绝调用 / 参数畸变 / parallel_tool_calls 退化，每种模式的症状和判断方法不同
+3. **给出了跨 Provider 兼容矩阵**，区分 anet E2E 验证过的格子和"provider 侧 API 行为需自行实测"的格子，避免填假数字
+4. **提供了两层降级策略**：system prompt 加固（轻）/ 主力+辅助分工（重）；换 Provider 本身是 L02 的选型决策，不在本节重复
+5. **给出了快速判断方法**：`anet logs --follow` + SQLite 查询 + 最小化验证，5 分钟内确认是不是 tool_use 问题
+
+**工程原则**：
+- 不做：把 tool_use 重度依赖的节点（协调、派活、汇总）放在未经 tool_use 验证的 Provider 上，然后靠运气
+- 要做：协调节点用 Anthropic 或 docs 明确标注兼容的 Provider（GLM / Kimi）；辅助节点用便宜的 Provider；新加 Provider 的节点先跑最小化验证（§5.3）再上多节点协作
+- 要做：所有需要 tool_use 的节点在 system prompt 里加明确的调用要求，不依赖模型的默认行为
+- 要做：`send_task` 之前调 `get_all_status` 确认目标在线——tool_use 失败和节点不在线在 Hub 侧的症状很像
+
+下一章（CH4 L01）：把 Hub 开放到局域网——当 Agent 分布在多台机器上时，多机部署带来的新问题。
+
+---
+
+## 附录：本节命令速查
+
+### 判断是否 tool_use 问题（30 秒流程）
+
+```bash
+# Step 1：看节点日志（实时跟踪）
+anet logs <node-name> --follow
+
+# Step 2：看任务状态分布
+sqlite3 ~/.commhub/commhub.db "
+SELECT status, COUNT(*) as cnt
+FROM tasks
+WHERE to_name = '<node-alias>'
+  AND created_at > DATETIME('now', '-1 hour')
+GROUP BY status;"
+
+# Step 3：最小化验证（Dashboard Chat → 给节点发一条任务，要求用工具回复）
+anet hub dashboard  # 打开 :3000 → Chat 面板
+```
+
+### system prompt 加固模板
+
+```
+关键规则（必须严格遵守）：
+1. 收到任务后，第一步调用 report_status，参数 status 填 "working"
+2. 完成任务后，调用 commhub_reply 返回结果，不能只输出文字
+3. 向其他 Agent 派活时，调用 send_task，to 参数只能填 alias 名称，不能填 task_id (UUID)
+4. 任何回复形式以 commhub_reply 调用为准，自然语言输出不算任务完成
+```
+
+### Provider 选型速查（tool_use 稳定性角度）
+
+| 场景 | 推荐 Provider |
+|---|---|
+| 协调节点（大量 send_task / commhub_reply）| Anthropic（首选）、GLM / Kimi（备选，接近 Anthropic 兼容）|
+| 辅助节点（纯生成，由主力收结果）| DeepSeek（性价比高，据社区反馈 tool_use 偶发失效）、书生等（先跑最小化验证）|
+| parallel_tool_calls 要求严格（并行派活）| Anthropic（原生支持，行为最稳定）|
+| OpenAI 模型（gpt-5.5 / o3）| codex-sdk runtime + `codex auth login`，不走 claude-agent-sdk |
+
+> **版本说明**：本节命令基于 anet v2.2.7-preview.3（源码实测）。兼容矩阵时效性强，Provider 发布新模型版本时行为可能变化，生产决策前以 anet.sh 官方文档最新状态或自行实测为准。
