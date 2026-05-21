@@ -1,0 +1,589 @@
+---
+title: "Mesh 派活四类常见问题诊断"
+order: 3
+estimated_minutes: 22
+---
+
+# Mesh 派活四类常见问题诊断
+
+> 六个 Agent 互相 `send_task`，你盯着终端等了两分钟，什么都没发生。本节把这种情况变成一个可重复的诊断流程。
+
+## 0. 一句话先讲明白
+
+**anet Mesh 没有固定的调用链，任务消失时没有自动的 step trace。你的工具是：Dashboard Tasks panel 看任务状态，直接 SQL 查 `~/.commhub/commhub.db` 追链路——这两件事组合，能定位多 Agent 协作的绝大多数问题。**
+
+---
+
+## 你将学到
+
+- Mesh 编排为什么天然有可观测性盲区，以及和 DAG step trace 的本质差异
+- 四类典型问题（路由失败 / task ID 漂移 / alias 冲突 / Ghost Task）的症状、根因和修法
+- `~/.commhub/commhub.db` 关键表的字段含义与实测读法
+- 五条可直接复用的诊断 SQL，覆盖从"任务在哪"到"谁卡住了"的完整链路
+- 给定根任务 ID 重建全部子任务树的递归 CTE（Mesh 链路全景还原）
+- 正确的 first-response 检查顺序，30 秒内定位问题类别
+
+## 适合谁
+
+已经完成 CH2 L01-L02（理解 CommHub 架构和 MCP 工具），现在第一次遇到 Mesh 派活不工作的工程师。
+
+---
+
+## 1. Mesh 的可观测性盲区
+
+> L01 §4 已建立 DAG vs Mesh 的完整对比，这里只做 30 秒 recap，聚焦对可观测性的影响。
+
+### 1.1 关键差异：没有预期的调用图
+
+DAG 框架（LangGraph 等）在执行前知道完整的调用图，所以能给出确定的 step trace：
+```
+step 1: parse_document  → ok (2.1s)
+step 2: extract_fields  → ok (0.8s)
+step 3: validate        → failed (ValueError: missing key)
+```
+
+anet Mesh 的任务图在运行时动态生成——A 可以派给 B，B 可以派给 C，C 可以直接回复 A 或再给 D 新建任务。框架不记录"我预期整条链路长什么样"，因为它根本不知道。结果是：当某个任务没有按预期完成时，没有"哪一步出错了"的直接答案。你得自己去 SQLite 里拼任务链路。
+
+### 1.2 anet 给了你什么
+
+可观测性不是零，有两件工具：
+
+**Dashboard Tasks panel**（`:3000` → Tasks 标签，面板深度用法见 CH5 L02）：列出所有任务的状态概览，可按状态过滤。适合快速定位"有没有 expired/failed 任务"。
+
+**直接 SQL 查 `~/.commhub/commhub.db`**：获取 Dashboard 没有暴露的字段细节——`from_name`、`to_name`、`in_reply_to`、`parent_task_id`、`task_events` 完整历史。这是本节的核心工具。
+
+### 1.3 四类问题的症状地图
+
+| 类别 | 典型症状 | 发现渠道 |
+|---|---|---|
+| 路由失败 | 任务 `expired`，收件方从没收到 | Dashboard 看到 expired 任务 |
+| task ID 漂移 | 任务 `expired`，`to_name` 是一个 UUID | SQL 查 `tasks.to_name` |
+| alias 冲突 / 脏数据 | 任务 `delivered` 但没执行，或发给已下线节点 | SQL 查 `sessions` |
+| Ghost Task（任务卡死）| 任务 `running` 状态持续数小时 | SQL 查 `tasks` + `task_events` |
+
+下面逐类展开。
+
+---
+
+## 2. commhub.db 关键表读法
+
+在进入诊断 playbook 之前，先建立对 SQLite schema 的基本认知——后续 SQL 都基于这些表。
+
+### 2.1 核心表一览
+
+commhub.db 共 15 张用户定义表（加上 SQLite 内部的 `sqlite_sequence` 共 16 行，与 L01 §3 中"16 张表"的计数一致）。本节只详解其中与诊断最相关的关键表；完整 DDL 见本节附录。
+
+```
+sessions        -- Agent 节点注册信息（alias、agent、状态）
+tasks           -- 所有派发的任务（主表）
+task_events     -- 任务状态变更历史（每次状态转移一行）
+inbox           -- 节点的收件箱（任务 / 消息 / 回复）
+completions     -- 完成记录（含打分、耗时）
+nodes           -- 节点配置（node_id、alias、runtime）
+networks        -- network 定义
+network_members -- network 成员（user_id、role）
+users           -- 用户账号
+api_tokens      -- API token（utok_ / ntok_）
+audit_log       -- 操作审计日志
+rename_txn      -- alias 重命名事务记录
+agent_telemetry -- 节点资源监控（CPU / MEM / DISK）
+licenses        -- 许可证（trial/paid，含到期时间、并发 agent 上限）
+network_invites -- network 邀请码（含 max_uses / expires_at）
+```
+
+诊断时最常用的是 `tasks`、`task_events`、`sessions`、`inbox` 四张表。
+
+### 2.2 `tasks` 表与状态机
+
+最关键的字段：
+
+```sql
+SELECT
+  task_id,        -- UUID，任务唯一 ID
+  from_name,      -- 派活方的 alias
+  to_name,        -- 收件方的 alias（task ID 漂移时这里会是 UUID）
+  status,         -- 任务当前状态（见下方状态机）
+  content,        -- 任务内容（文本）
+  expires_at      -- 过期时间（到期未 reply 则 status → expired）
+FROM tasks;
+```
+
+**任务状态机**（实测 `task_events.to_status` 的全部观测值）：
+
+```
+(none) → delivered → acked → running → replied
+                                      → failed
+                   → expired （送达后超时未 reply）
+                   → cancelled
+```
+
+重要：`tasks` 表的 DDL 中 `status DEFAULT 'created'`，但 MCP `send_task` 路径直接以 `'delivered'` 写入——跳过 `created`，`task_events` 表里从不会出现 `to_status = 'created'`（本机 0 行实测确认）。`created` 是 DDL 的保底值，不是实际流转的状态节点。
+
+### 2.3 `task_events` 表
+
+每次任务状态变更，这里写一行：
+
+```sql
+SELECT from_status, to_status, actor, detail, created_at
+FROM task_events
+WHERE task_id = '<你要查的 task_id>'
+ORDER BY created_at;
+```
+
+实测一条正常完成任务的事件序列：
+
+```
+from_status  to_status  actor          created_at
+-----------  ---------  ------         ----------
+NULL         delivered  发件节点名      2026-05-21 11:25:18
+delivered    acked      收件节点名      2026-05-21 11:25:18
+NULL         replied    收件节点名      2026-05-21 11:25:25
+```
+
+注意第一条 `from_status = NULL`（即"从无到 delivered"），以及 replied 的 `from_status` 也可能为 NULL（源码里 `logTaskEvent` 对 replied 不传前状态）。
+
+### 2.4 `sessions` 表关键字段
+
+```sql
+SELECT
+  alias,         -- 节点的 alias（send_task 的 to 参数值）
+  status,        -- 'idle' / 'working' / 'offline'
+  updated_at,    -- 最后更新时间（10 分钟无更新自动变 offline）
+  last_seen_at   -- 最后一次 SSE 心跳时间
+FROM sessions;
+```
+
+`sessions.alias` 就是 `send_task` 里 `to` 参数的值。如果目标 alias 在 `sessions` 里查不到，任务仍会被 Hub 接受（静默写入 `tasks` 表，状态 `delivered`），等到 `expires_at` 到期后由 patrol 置为 `expired`。
+
+---
+
+## 3. 四类问题诊断 Playbook
+
+### 3.1 路由失败 — 任务 expired，收件方从没收到
+
+**症状**：发了一个任务，等了很久没有回复，Dashboard 里任务 status 是 `expired`。
+
+**根因**：目标 alias 不存在或节点已下线。Hub 不做存在性检查，直接接受并写入 `delivered`；节点没有 SSE 连接，任务没有被 `acked`；patrol 定时扫描，`expires_at` 到期后置为 `expired`。
+
+**诊断**：
+
+```sql
+-- Step 1：确认 expired 任务
+SELECT task_id, from_name, to_name, created_at, expires_at
+FROM tasks
+WHERE status = 'expired'
+ORDER BY created_at DESC
+LIMIT 50;
+
+-- Step 2：确认目标 alias 是否存在
+SELECT alias, status, updated_at, last_seen_at
+FROM sessions
+WHERE alias = '<目标 alias>';
+```
+
+返回空 → 从未注册。返回但 `status = 'offline'` → 注册过但当前不在线。
+
+**修法**：
+- alias 拼错 → 检查大小写/全半角
+- 节点没起来 → `anet node start <name>` 重新启动
+- 节点已下线 → 重启节点，或改用 `get_all_status` 先查在线列表再发
+- 已 expired 的任务无法复活 → 重新调用 `send_task` 发新任务（或用 `retry_task` 工具重投）
+
+---
+
+### 3.2 对不存在 alias 派活的两阶段行为
+
+这是 §3.1 路由失败的一个特殊子集，值得单独说清楚，因为现象容易误判。
+
+**实测行为**（anet v2.2.7-preview.1，源码 `tools.ts` `send_task` 确认）：
+
+1. `send_task` **不检查** `alias` 是否存在于 `sessions` 表，直接写入 `tasks`（`status = 'delivered'`）并写 `inbox`，立即返回 `ok: true`。
+2. Hub 推送 SSE 事件到目标 alias 的频道——如果没有节点订阅，SSE 无人接收，任务安静挂在那里。
+3. patrol 定时扫描（每 5 分钟一轮），`expires_at` 到期后置为 `expired`，写一条 `to_status = 'expired'` 的 task_event，actor 为 `patrol`。
+
+这个已知行为对应 [issue #172](https://github.com/sleep2agi/agent-network/issues/172)：`send_task` 对不存在的 alias 应该返回警告但目前不会。
+
+**实测 task_events 轨迹**（`to_name = 'worker-b'`，该节点不在线）：
+
+```
+from_status  to_status  actor         event_at
+-----------  ---------  ------------  --------------------
+NULL         delivered  orchestrator  2026-05-21 07:48:15   ← Hub 立即写入
+NULL         expired    patrol        2026-05-21 08:52:43   ← TTL 到期后清场
+```
+
+没有 `acked`，没有中间状态——任务从 `delivered` 直接跳到 `expired`，时间差约等于 `ttl_seconds`（默认 3600 秒）。
+
+**工程含义**：在发 `send_task` 前，先调 `get_all_status` 确认目标 alias 存在且在线，是 Mesh 编排的工程最佳实践。
+
+---
+
+### 3.3 task ID 漂移 — Agent 把 task_id 当成了 alias
+
+**症状**：任务 `expired`，但 `to_name` 看起来像一个 UUID（`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`）。
+
+**根因**：Agent 在上下文里积累了大量 `task_id`（UUID 格式），上下文一长，它把 UUID 错填到了 `send_task` 的 `to` 参数。这在任务链超过 3-4 层、对话 token 接近上下文窗口上限时更容易出现。
+
+**诊断 SQL**：
+
+```sql
+SELECT task_id, from_name, to_name, status, created_at
+FROM tasks
+WHERE status IN ('expired', 'failed')
+  AND to_name LIKE '%-%-%-%-%'
+  AND to_name NOT IN (SELECT alias FROM sessions WHERE alias IS NOT NULL)
+ORDER BY created_at DESC;
+```
+
+**修法**：
+- 短期：明确写出目标 alias 名称，重新发 `send_task` 指令
+- 系统层：在 Agent system prompt 里加规则："调用 `send_task` 时，`to` 字段只能填节点的 alias 名称，绝对不能填 task_id（UUID）"
+- 验证层：发 `send_task` 前先调 `get_all_status`，在返回的节点列表里找 alias——找到再发，找不到停下来问用户
+
+---
+
+### 3.4 Ghost Task — running 状态挂起
+
+**症状**：一个任务在 Dashboard 里长时间显示 `running`，对应节点没有产出，也没有 `replied`。
+
+**根因**：Agent 进程在任务执行过程中崩溃（OOM、网络断开、LLM API 超时等），但没来得及调用 `send_reply` 或报 `failed`。`task_events` 里最后一条是 `→ running`，之后再无变化。
+
+**诊断 SQL — 找卡死的 running 任务**：
+
+```sql
+SELECT
+  task_id,
+  from_name,
+  to_name,
+  started_at,
+  ROUND((JULIANDAY('now') - JULIANDAY(started_at)) * 24 * 60, 1) AS running_minutes
+FROM tasks
+WHERE status = 'running'
+  AND started_at IS NOT NULL
+  AND started_at < DATETIME('now', '-30 minutes')
+ORDER BY started_at;
+```
+
+本机实测（Ghost Task 样例，alias 已脱敏）：
+
+```
+task_id                               from_name  to_name   started_at           running_minutes
+------------------------------------  ---------  --------  -------------------  ---------------
+0bc21ae6-12f2-4a93-b348-a0cf222d819f  admin      worker-a  2026-05-19 03:34:51  3395.8
+```
+
+**查该任务的完整事件链（诊断 SQL [4]）**：
+
+```sql
+SELECT from_status, to_status, actor, detail, created_at
+FROM task_events
+WHERE task_id = '0bc21ae6-12f2-4a93-b348-a0cf222d819f'
+ORDER BY created_at;
+```
+
+输出：
+
+```
+from_status  to_status  actor     created_at
+-----------  ---------  --------  --------------------
+NULL         delivered  admin     2026-05-19 03:25:36
+delivered    acked      worker-a  2026-05-19 03:26:40
+NULL         running    worker-a  2026-05-19 03:34:51
+```
+
+最后一条是 `→ running`，之后没有任何事件——节点在 `running` 状态时失联了。
+
+**修法**：
+
+Ghost Task 无法自动恢复。推荐路径：
+
+**1. 确认节点确实已死**
+
+```bash
+anet node ls
+# 看 SSE 列：● = 在线，○ = 离线
+```
+
+**2. 用 `cancel_task` MCP 工具取消任务**（唯一推荐路径，参数/语义见 L02 §3.8）
+
+`cancel_task` 在 Hub 侧执行状态变更，`WHERE status IN ('created', 'delivered', 'acked', 'running')`——`running` 状态可取消。它是 Hub 操作，不需要已死的节点参与，任何 MCP 客户端（CLI、另一个 Agent、curl）都可以调：
+
+```
+# 在任意 MCP 客户端里调用（替换为实际 task_id）
+cancel_task(
+  task_id = "0bc21ae6-12f2-4a93-b348-a0cf222d819f",
+  reason  = "Ghost task: node died without reply"
+)
+```
+
+调用成功返回 `{ ok: true, cancelled: true }`，Hub 同步写入 `task_events`（`running → cancelled`），并 ack 掉 inbox 条目，防止节点重启后重新拾取。
+
+**3. 重新派活**
+
+Ghost Task 取消后，如果业务上还需要完成该任务，重启节点后重新发一条新任务。
+
+**裸 SQL 写操作（最后手段，不推荐）**
+
+> 只有在 Hub 进程本身无法启动、无法通过任何 MCP 客户端调用 `cancel_task` 时才考虑直接改库。`commhub.db` 处于 WAL 模式，Hub 运行期间写操作存在一致性风险（`tasks`/`task_events`/`inbox`/`sessions` 需要手动保持多表一致，极易漏写）。
+
+**在执行任何 SQL 写操作之前，必须先停止 Hub：**
+
+```bash
+# 先停 Hub
+Ctrl+C  # 或 kill $(pgrep -f commhub-server)
+```
+
+然后手动改库：
+
+```sql
+-- 将 Ghost Task 状态置为 cancelled
+UPDATE tasks
+SET status = 'cancelled', completed_at = DATETIME('now')
+WHERE task_id = '0bc21ae6-12f2-4a93-b348-a0cf222d819f'
+  AND status = 'running';
+
+-- 同步写一条 task_events 记录
+INSERT INTO task_events (task_id, from_status, to_status, actor, detail, created_at)
+VALUES (
+  '0bc21ae6-12f2-4a93-b348-a0cf222d819f',
+  'running', 'cancelled',
+  'manual',
+  'Ghost task: node died without reply, manually cancelled',
+  DATETIME('now')
+);
+
+-- 同步 ack inbox 条目，防止节点重启后重新拾取
+UPDATE inbox SET acked = 1
+WHERE id = '0bc21ae6-12f2-4a93-b348-a0cf222d819f' AND acked = 0;
+```
+
+改完重启 Hub，Hub 读取 SQLite 时会反映改动。
+
+**预防**：在 Agent system prompt 里要求把长任务拆小、频繁调 `report_status` 打进度。正确设置 `ttl_seconds`（见 §4 预防习惯）——超时自动 expired 比无限挂着 running 更容易发现。
+
+---
+
+### 3.5 alias 冲突与脏数据
+
+**症状**：一个 alias 的节点上线了，但另一个同名节点也在（或曾经在）sessions 表里；或者节点重命名后，旧 alias 还在任务链里流传。
+
+**诊断 SQL — 检查重复 alias**：
+
+```sql
+SELECT alias, COUNT(*) as cnt
+FROM sessions
+GROUP BY alias
+HAVING cnt > 1;
+```
+
+返回空则 alias 唯一性没有问题。
+
+**诊断 SQL — 查 rename_txn 记录**：
+
+```sql
+SELECT old_alias, new_alias, status, prepared_at, committed_at
+FROM rename_txn
+ORDER BY prepared_at DESC;
+```
+
+`status = 'committed'` 表示重命名已完成，`old_alias` 不再有效。如果系统里还有 Agent 在往 `old_alias` 发任务，这些任务会全部 expired。
+
+**修法**：
+- 重命名节点后，通知所有需要与该节点通信的 Agent 更新目标 alias
+- 不要在 system prompt 里硬编码 alias，改用 `get_all_status` 动态查询在线节点列表
+
+---
+
+## 4. 诊断 SQL 速查（五条 + 一条递归 CTE）
+
+诊断 SQL 的 canonical 完整版在附录，此处只列标题索引：
+
+- **[1]** 近 24 小时 expired 任务（路由失败主要来源）
+- **[2]** to_name 是 UUID 的任务（task ID 漂移）
+- **[3]** running 超过 30 分钟的任务（Ghost Task）
+- **[4]** 某任务完整事件链（替换 task_id）
+- **[5]** 当前在线节点状态
+
+**[6] 递归 CTE — 给定根任务 ID 重建完整子任务树（新增）**
+
+Mesh 编排里，一个根任务可能通过 `parent_task_id` 衍生出多层子任务。当你拿到一个顶层 task_id 却不知道它派出了哪些子任务、子子任务在哪个状态时，用这条递归查询还原整棵任务树：
+
+```sql
+-- 给定 root task_id，递归找出全部子任务
+WITH RECURSIVE chain AS (
+    SELECT task_id, from_name, to_name, status, parent_task_id, content
+    FROM tasks
+    WHERE task_id = '${ROOT_TASK_ID}'
+    UNION ALL
+    SELECT t.task_id, t.from_name, t.to_name, t.status, t.parent_task_id, t.content
+    FROM tasks t
+    JOIN chain c ON t.parent_task_id = c.task_id
+)
+SELECT * FROM chain ORDER BY task_id;
+```
+
+替换 `${ROOT_TASK_ID}` 为实际的根任务 ID。输出的每一行是一个节点，`parent_task_id` 列让你看清层级关系。如果你想要纯文本树形展示，在 Python 里对结果按 `parent_task_id` 分组再递归打印即可。
+
+> 注意：`parent_task_id` 字段是在 `send_task` 时由调用方传入（或由 Hub 根据 caller 最近的 in-flight task 自动推断），不是所有任务都有。链路短或不经 sub-tasking 的 Mesh 拓扑，这张树可能只有一层。
+
+---
+
+## 5. 正确的 First Response：30 秒定位问题类别
+
+遇到"任务没完成"时，按这个顺序检查：
+
+**Step 1 — 打开 Dashboard Tasks panel，看状态分布**（面板深度用法见 CH5 L02）
+
+访问 `http://localhost:3000` → Tasks 标签：
+
+- 有 `expired` 任务 → 路由失败或 task ID 漂移（继续 Step 2）
+- 有 `running` 任务长时间没动 → Ghost Task（继续 Step 3）
+- 全是 `acked` 但没有 `replied` → 节点在跑但没回复，查 `anet logs <name>`
+
+**Step 2 — 查 expired 任务的 to_name**
+
+运行附录诊断 SQL [1] 和 [2]：
+
+- `to_name` 是正常 alias → 路由失败，检查目标节点是否在线（`anet node ls`）
+- `to_name` 是 UUID → task ID 漂移，检查 Agent 上下文，重新发指令
+
+**Step 3 — 检查 Ghost Task**
+
+运行附录诊断 SQL [3]，发现 running 超过预期时间的任务，查该任务的事件链（SQL [4]），确认最后一条事件是 `→ running`，然后用 `cancel_task` 清场（见 §3.4）。
+
+**Step 4 — 确认在线节点列表**
+
+运行附录诊断 SQL [5] 或 `anet node ls`，确认每个应该在线的节点都有 `SSE=●`。有节点掉线 → 重启该节点。
+
+```bash
+anet node ls
+# 看 SSE 列：● = 在线，○ = 离线
+```
+
+**Step 5 — 看节点日志**
+
+如果前四步没有定位到，看具体节点的日志：
+
+```bash
+anet logs <node-name>
+```
+
+找错误堆栈（API key 失效、LLM API 超时、工具调用报错）。
+
+---
+
+## 6. 预防习惯
+
+debug 是发生了问题之后的事。以下工程习惯能减少一半的 Mesh 派活翻车：
+
+`send_task` 之前先调 `get_all_status` 确认目标在线；不要在 system prompt 里硬编码 alias，让 Agent 动态查当前在线节点列表；让接收任务的 Agent 频繁调 `report_status` 汇报进度（Ghost Task 发生时至少知道跑到了哪里）；给每个 `send_task` 设置合理的 `ttl_seconds`（单位秒，默认 3600，最大 86400）——超时自动 expired 比无限挂着 running 更容易发现，且 `timeout` 参数名不存在，写了会被静默忽略。
+
+---
+
+## 总结
+
+本节做了五件事：
+
+1. **解释了 Mesh 的可观测性盲区**——没有 step trace，任务链路需要你自己用 SQL 拼
+2. **建立了 commhub.db 的阅读基础**——15 张用户表 + sqlite_sequence，四张核心诊断表的字段含义和状态机
+3. **给出了四类典型问题的诊断 playbook**：路由失败、task ID 漂移、Ghost Task、alias 冲突
+4. **提供了五条诊断 SQL + 一条递归 CTE** + 30 秒定位问题类别的 first-response 流程
+5. **明确了 Ghost Task 的正确修法**：`cancel_task` 是唯一推荐路径，裸 SQL 写操作是最后手段且必须先停 Hub
+
+下一节（CH2 L04）：把 Agent 接到 Telegram / 微信 / 飞书——`anet channel add` 的配置方法和各平台限制。
+
+---
+
+## 附录：本节命令 + SQL 速查
+
+### CLI 命令
+
+```bash
+# 快速看节点状态（SSE 是否在线）
+anet node ls
+
+# 看具体节点日志（找错误堆栈）
+anet logs <node-name>
+
+# 诊断整体环境
+anet doctor
+```
+
+### Python 查询模板
+
+```python
+import sqlite3, pathlib
+
+db = pathlib.Path.home() / '.commhub' / 'commhub.db'
+conn = sqlite3.connect(str(db))
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+
+# 替换下面的 SQL 为任意一条诊断 SQL
+sql = """
+SELECT task_id, from_name, to_name, status, created_at
+FROM tasks
+WHERE status = 'expired'
+ORDER BY created_at DESC
+LIMIT 20
+"""
+cur.execute(sql)
+for row in cur.fetchall():
+    print(dict(row))
+conn.close()
+```
+
+### 五条诊断 SQL（canonical）
+
+```sql
+-- [1] 近 24h expired 任务（路由失败主要来源）
+SELECT task_id, from_name, to_name, created_at, expires_at
+FROM tasks
+WHERE status = 'expired'
+  AND created_at > DATETIME('now', '-24 hours')
+ORDER BY created_at DESC;
+
+-- [2] task ID 漂移（to_name 是 UUID）
+SELECT task_id, from_name, to_name, status, created_at
+FROM tasks
+WHERE status IN ('expired', 'failed')
+  AND to_name LIKE '%-%-%-%-%'
+  AND to_name NOT IN (SELECT alias FROM sessions WHERE alias IS NOT NULL)
+ORDER BY created_at DESC;
+
+-- [3] Ghost Task（running 超过 30 分钟）
+SELECT task_id, from_name, to_name, started_at,
+  ROUND((JULIANDAY('now') - JULIANDAY(started_at)) * 24 * 60, 1) AS running_minutes
+FROM tasks
+WHERE status = 'running'
+  AND started_at < DATETIME('now', '-30 minutes')
+ORDER BY started_at;
+
+-- [4] 某任务完整事件链（替换 task_id）
+SELECT from_status, to_status, actor, detail, created_at
+FROM task_events
+WHERE task_id = 'YOUR-TASK-ID-HERE'
+ORDER BY created_at;
+
+-- [5] 当前在线节点
+SELECT alias, status, updated_at, last_seen_at, task
+FROM sessions
+WHERE status != 'offline'
+ORDER BY updated_at DESC;
+
+-- [6] 递归 CTE — 重建根任务的完整子任务树
+WITH RECURSIVE chain AS (
+    SELECT task_id, from_name, to_name, status, parent_task_id, content
+    FROM tasks
+    WHERE task_id = '${ROOT_TASK_ID}'
+    UNION ALL
+    SELECT t.task_id, t.from_name, t.to_name, t.status, t.parent_task_id, t.content
+    FROM tasks t
+    JOIN chain c ON t.parent_task_id = c.task_id
+)
+SELECT * FROM chain ORDER BY task_id;
+```
+
+> **注意**：Hub 运行期间 `commhub.db` 处于 WAL 模式，SELECT 查询安全（WAL 允许多个读者并发，不影响 Hub 写入）。只有写操作（UPDATE / DELETE / INSERT）需要先停 Hub。
+
+> **版本说明**：本节基于 anet v2.2.7-preview.1，commhub.db schema 在本机实测（commhub-server 源码 `tools.ts` 确认）。CLI 包版本以 `anet -v` 实际输出为准。SQLite schema 可能随 Hub 版本更新变化，以 `anet hub start` 实际创建的库为准。

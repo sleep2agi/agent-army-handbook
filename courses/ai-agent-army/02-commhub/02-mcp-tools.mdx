@@ -1,0 +1,559 @@
+---
+title: "17 个 MCP 工具实战 — send_task / report_status / get_all_status …"
+order: 2
+estimated_minutes: 22
+---
+
+# 17 个 MCP 工具实战 — send_task / report_status / get_all_status …
+
+> 每一个 Agent 动作——派活、报进度、回复、查状态——背后都是一次 MCP 工具调用。搞清楚这 17 个工具，你就搞清楚了 anet 的通信神经系统。
+
+## 0. 一句话先讲明白
+
+**CommHub Server 在 `/mcp` 端点暴露 17 个 MCP 工具。Agent 运行时每次派活、回复、查状态，本质上都是调这套 API。** 工具分四类：派活（3）/ 查询（5）/ 回复（4）/ 状态（5）。搞清楚每类的触发时机和关键参数，Agent 之间的通信就不再是黑盒。
+
+---
+
+## 你将学到
+
+- CommHub MCP 端点的鉴权机制，以及两套工具集的区别（Server 侧 vs Agent 内置）
+- 17 个工具按用途全分类：派活 / 查询 / 回复 / 状态，每个工具的参数含义和触发时机
+- 核心工具 `send_task` / `commhub_reply` / `get_all_status` / `report_status` 的完整参数表
+- Agent 在对话里怎么调用这些工具（MCP 工具注入原理）
+- 两个 Agent 互相派活的最小可跑例子：发起方 `send_task`，接收方 `commhub_reply` 回结果
+
+## 适合谁
+
+已跑通 CH1（Hub 在 `:9200` 运行，至少一个 Agent 节点上线过），想理解 Agent 之间通信底层机制的工程师。建议先读 CH2 L01（17 工具分类总览）再来这里做深度展开。
+
+---
+
+## 1. MCP 端点与鉴权
+
+CommHub Server 在 `:9200/mcp` 暴露一套 MCP Streamable HTTP 接口（协议：jsonrpc 2.0，传输：Streamable HTTP，即每个请求返回 `text/event-stream` 格式的 SSE 事件流）。任何持有有效 token 的客户端都可以调，不限于 anet CLI。
+
+```bash
+# 查询完整工具列表（实测命令，需要先拿到 token）
+TOKEN=$(python3 -c "import json; d=json.load(open('$HOME/.anet/config.json')); print(d['token'])")
+
+# 初始化 MCP 会话（Accept 头必须同时包含两种类型）
+curl -s -X POST http://127.0.0.1:9200/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"my-client","version":"1.0"}}}'
+
+# 列出工具
+curl -s -X POST http://127.0.0.1:9200/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+```
+
+实测返回 17 个工具（CommHub Server npm 包 `@sleep2agi/commhub-server@0.8.2`，MCP 协议版本 `2025-03-26`，anet npm 包 `@sleep2agi/agent-network@2.2.7-preview.1`）。
+
+### 1.1 两套工具集：Server 侧 vs Agent 内置
+
+这是新手最容易混淆的地方，先厘清：
+
+| 工具集 | 暴露端点 | 谁调 | 工具名前缀 |
+|---|---|---|---|
+| **CommHub Server MCP 工具**（17 个）| `:9200/mcp` | CLI、Dashboard、其他程序 | 无前缀（`send_task`、`get_all_status`…）|
+| **Agent 内置 MCP 工具**（5 个）| Agent 进程 stdio | Agent 自己（LLM 对话内） | `commhub_`（`commhub_send_task`、`commhub_reply`…）|
+
+Agent 内置的 5 个工具（`commhub_reply` / `commhub_report_status` / `commhub_send_task` / `commhub_send_message` / `commhub_get_all_status`）是 agent-node 在启动时通过 MCP stdio（标准输入输出作为双向管道，LLM runtime 通过这条管道发现并调用工具）注入给 LLM 的。LLM 在对话中调用 `commhub_send_task`，agent-node 再把它翻译成对 Server 的 `send_task` HTTP 调用。
+
+**本节以 Server 侧 17 个工具为主线**，每个工具描述时同步标注 Agent 对话里用哪个内置工具触发。
+
+---
+
+## 2. 全工具分类速查表
+
+CH2 L01 已给出 17 工具分类总览；本节在此基础上深度展开每个工具的参数和行为。完整速查表见本节末尾附录，以下正文只保留关键摘要。
+
+### 派活类（3 个）
+
+| 工具 | 用途 | Agent 内置对应 |
+|---|---|---|
+| `send_task` | 向指定 alias 派一条有生命周期的任务 | `commhub_send_task` |
+| `send_message` | 向指定 alias 发一条消息（无任务生命周期，纯 chat） | `commhub_send_message` |
+| `broadcast` | 向当前 network 内所有（或按 status 过滤的）Agent 广播消息 | — |
+
+### 查询类（5 个）
+
+| 工具 | 用途 | Agent 内置对应 |
+|---|---|---|
+| `get_all_status` | 获取当前 network 所有 Agent 的状态列表 | `commhub_get_all_status` |
+| `get_session_status` | 获取指定 alias 的详细状态 | — |
+| `get_task` | 按 task_id 查单条任务详情（状态、结果、时间戳）| — |
+| `list_tasks` | 按条件过滤任务列表（alias、status、sender 等）| — |
+| `get_completions` | 查最近完成的任务汇总 | — |
+
+### 回复类（4 个）
+
+| 工具 | 用途 | Agent 内置对应 |
+|---|---|---|
+| `send_reply` | 回复一条任务（关联 `in_reply_to`，触发发起方通知）| — |
+| `send_ack` | 仅确认收到任务（不进 inbox，只改 task status）| — |
+| `get_inbox` | 拉取自己的待处理消息列表 | — |
+| `ack_inbox` | 确认收到 inbox 消息（消除 inbox 计数）| — |
+
+### 状态类（5 个）
+
+| 工具 | 用途 | Agent 内置对应 |
+|---|---|---|
+| `report_status` | 上报自己的状态（working / idle / blocked / error 等）| `commhub_report_status` |
+| `report_completion` | 上报任务完成及产出物（含 artifacts、score、duration） | — |
+| `retry_task` | 重试失败、过期或已取消的任务（重置为 delivered，重入 inbox）| — |
+| `cancel_task` | 取消一条进行中的任务（delivered / acked / running 状态均可）| — |
+| `reassign_task` | 把任务重新分配给另一个 Agent | — |
+
+
+---
+
+## 3. 核心工具详解
+
+### 3.1 `send_task` — 派活的起点
+
+```
+用途：向指定 alias 的 Agent 派一条任务，任务有完整生命周期（delivered → acked → replied / failed / cancelled）
+```
+
+**完整参数（来自 CommHub Server 实测）：**
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `alias` | string | ✅ | 目标 Agent 的 alias（注册名）|
+| `task` | string | ✅ | 任务内容，max 10000 字符 |
+| `priority` | string | — | `"high"` / `"normal"` / `"low"`，默认 `"normal"` |
+| `context` | string | — | 附加上下文，max 10000 字符，不进主 task 字段 |
+| `from_session` | string | — | 派活方的 alias，留空时 Hub 填当前认证用户 |
+| `ttl_seconds` | number | — | 任务有效期（秒），默认 3600，最大 86400 |
+| `parent_task_id` | string | — | 父任务 ID；子任务完成时 Hub 自动把结果链回父任务发起方 |
+| `network_id` | string | — | 不填默认用当前 token 的 network |
+
+`parent_task_id` 是多级委派的关键：Agent A 收到人的任务 → A 把子任务派给 B（带 `parent_task_id`）→ B 完成后 Hub 自动把结果链回父任务，最终到达根任务发起方。
+
+**自动推断兜底**：Agent 调 `send_task` 时如果没有显式传 `parent_task_id`，Hub 会自动取"该 agent 最近一条仍处于 `delivered` 或 `started` 状态的任务"作为 parent（实测来自 `commhub-server@0.8.2` 源码）。这是防止 LLM 忘传参数的安全网，不是推荐用法——需要确定性链路时应显式传参。
+
+**任务状态流：**
+
+```
+send_task → delivered
+ack_inbox / send_ack → acked
+commhub_reply(status="completed") → replied      # 终态
+commhub_reply(status="failed")    → failed       # 终态
+commhub_reply(status="cancelled") → cancelled    # 终态
+commhub_reply(status="blocked"/"error"/"in_progress") → 状态更新，任务不关闭
+cancel_task → cancelled                          # 终态
+retry_task → 重置回 delivered
+```
+
+### 3.2 `commhub_reply` — 接活方的标准回法
+
+在 Agent 对话中，接收到任务后的标准回复工具。Agent LLM 直接调用，agent-node 把它翻译成 Server 侧的 `send_reply` + 状态更新。
+
+```
+commhub_reply(
+  task_id: "<来自 channel 消息的 task_id>",
+  text: "任务完成，已输出 REPORT.md",
+  status: "completed"   # 6 个合法值见下表
+)
+```
+
+`status` 字段语义（实测 agent-node `node-server.ts` 的 `commhub_reply` 工具 schema，共 6 个合法值，分两组）：
+
+| status | 分组 | 含义 |
+|---|---|---|
+| `completed` | 终态 | 成功完成；Hub 内部映射成任务状态 `replied` |
+| `failed` | 终态 | 执行失败 |
+| `cancelled` | 终态 | 主动取消 |
+| `blocked` | 非终态 | 被阻塞、等外部条件——任务不关闭 |
+| `error` | 非终态 | 出错但未放弃——任务不关闭 |
+| `in_progress` | 非终态 | 进行中的进度汇报——任务不关闭 |
+
+前三个是**终态**，回复后任务关闭；后三个是**状态更新**，任务保持打开——所以 `commhub_reply` 既能交终稿、也能中途报"我卡住了"。注意区分：`commhub_reply` 改的是**任务**状态，`commhub_report_status(status="working"/"idle"/"blocked"/"error")` 改的是**当前 session** 的状态，两者层级不同。
+
+### 3.3 `get_all_status` — Agent 侦察全局
+
+派活之前，Agent 先看看有谁在线。
+
+```
+get_all_status(
+  filter_status: "idle",   # 可选，只看空闲的 Agent
+  network_id: "net_..."    # 可选，不填默认本 network
+)
+```
+
+实测返回格式（节选）：
+
+```json
+{
+  "ok": true,
+  "sessions": [
+    {
+      "alias": "reviewer-1",
+      "status": "idle",
+      "task": null,
+      "server": "my-machine",
+      "updated_at": "2026-05-21T10:00:00.000Z"
+    },
+    {
+      "alias": "judge",
+      "status": "working",
+      "task": "汇总三份 reviewer 报告",
+      "updated_at": "2026-05-21T10:01:30.000Z"
+    }
+  ]
+}
+```
+
+Agent 在对话里用 `commhub_get_all_status()` 触发，不需要参数（内置工具已绑定当前 network）。
+
+**常见用法**：orchestrator Agent 在分发子任务前先调一次 `get_all_status`，确认目标 Agent 是 `idle` 再 `send_task`，避免派给正在工作的 Agent 导致排队积压。
+
+### 3.4 `report_status` — 心跳与状态上报
+
+Agent 节点启动后按固定间隔自动调一次心跳（实测 agent-node dist 中 `setInterval(..., 180000)`，即 180 秒），同时在任务开始 / 结束时主动调。
+
+关键参数：
+
+| 参数 | 说明 |
+|---|---|
+| `resume_id` | 本次 Claude session UUID（运行时唯一）|
+| `alias` | 本节点 alias |
+| `status` | `working` / `idle` / `blocked` / `error` / `waiting_input` / `offline` |
+| `task` | 当前任务描述（max 10000 字符）|
+| `progress` | 进度 0-100（可选）|
+| `score` | 自评分 1-10（可选）|
+
+返回值里含 `inbox_count`，Agent 用它判断是否有新任务等待处理。
+
+Agent 在对话里用 `commhub_report_status(status="working", task="正在分析 PR diff...")` 触发。
+
+### 3.5 `send_message` vs `send_task` — 何时用哪个
+
+这是新手容易混淆的第一个坑：
+
+| 维度 | `send_task` | `send_message` |
+|---|---|---|
+| 任务生命周期 | ✅ 有（delivered → replied） | ❌ 无 |
+| 进 inbox | ✅ 进，触发 SSE 推送 | ✅ 进，触发 SSE 推送 |
+| 结果追踪 | ✅ 可用 `get_task` 查结果 | ❌ 不记录结果 |
+| 适用场景 | 需要对方做事并回报结果 | 通知、状态播报、中间沟通 |
+
+一句话：**需要对方回报结果 → `send_task`；只是告知对方 → `send_message`**。
+
+anet 文档马在 CH2 review 时特别指出：`send_message` 进 inbox 且触发 SSE——只是不记录结果，不能用 `get_task` 查。不要误以为它"悄悄发不触发对方"。
+
+### 3.6 `broadcast` — 全员广播
+
+向当前 network 的所有 Agent（或按 status 过滤的子集）广播一条消息：
+
+```
+broadcast(
+  message: "所有节点：Hub 将在 5 分钟后重启，请保存进度",
+  filter_status: "working"   # 可选，只发给正在工作的
+)
+```
+
+**注意**：`broadcast` 是消息（无任务生命周期），不是任务。对方收到的是 `send_message` 语义的通知，不进 task 追踪链路。适合协调性广播（如暂停、通知重启），不适合派实际任务。
+
+### 3.7 查询类工具：get_task / list_tasks / get_completions
+
+这三个是 orchestrator 和 Dashboard 最常用的查询工具，直接对应 Dashboard Tasks 面板。
+
+**`get_task`** — 轮询单条任务结果：
+
+```
+get_task(task_id: "task_abc123")
+```
+
+返回：`status` / `result`（被回复的文本）/ `from_name` / `to_name` / `created_at` / `replied_at`。
+
+典型用法：`send_task` 后，orchestrator 每隔 N 秒 `get_task` 一次，直到 `status` 变为终态（`replied` / `failed` / `cancelled`）。
+
+**`list_tasks`** — 批量查任务：
+
+```
+list_tasks(
+  alias: "reviewer-1",    # 只看发给 reviewer-1 的
+  status: "delivered",    # 只看还没被接的
+  limit: 20
+)
+```
+
+`from_name` 参数可以过滤"由我派出去的所有任务"，便于 orchestrator 自查。
+
+**`get_completions`** — 任务完成汇总：
+
+```
+get_completions(
+  since: "2026-05-21T00:00:00Z",
+  limit: 50
+)
+```
+
+返回近期有 `report_completion` 记录的任务，含 `result`、`artifacts`、`score`、`duration_minutes`。
+
+> **`get_task` vs `get_completions` 的区别**：`get_task` 读 `tasks` 表——只要 `send_task` 派过就有记录；`get_completions` 读 `completions` 表——只有 Agent 显式调 `report_completion` 才写入。普通 `commhub_reply(status="completed")` 走的是 `send_reply` 路径，**不写 completions 表**。`completions` 表的唯一写入点是 `report_completion`。两者面向不同数据源，不要混用。
+
+### 3.8 任务生命周期管理：retry / cancel / reassign
+
+这三个工具是 Mesh 调度的"补救手段"，在 CH2 L03 mesh-debug 中会深入用到，这里先讲清楚语义。
+
+**`cancel_task`** — 取消任务：
+
+```
+cancel_task(
+  task_id: "task_abc123",
+  reason: "目标 Agent 离线，改由人工处理"
+)
+```
+
+适用于 `created` / `delivered` / `acked` / `running` 状态的任务。终态任务（`replied` / `failed` / `cancelled`）无法再取消。
+
+**`retry_task`** — 重试任务：
+
+```
+retry_task(task_id: "task_abc123")
+```
+
+把任务状态重置为 `delivered`，重新入 inbox。适合：目标 Agent 超时没回、任务意外 `failed` 需要重跑。
+
+> **重试前先确认对方状态**：`retry_task` 不检查目标 Agent 是否 online，重试进 inbox 后如果对方还是 offline，任务会在 inbox 里等着（或过 TTL 过期）。先 `get_session_status` 确认目标在线再重试。
+
+**`reassign_task`** — 改派：
+
+```
+reassign_task(
+  task_id: "task_abc123",
+  new_alias: "backup-reviewer"
+)
+```
+
+把任务从原目标改派到 `new_alias`。适合：原来的 Agent 掉线、需要换一个同类 Agent 接手。重派后原 task_id 不变，`to_name` 字段更新。
+
+### 3.9 inbox 机制：get_inbox / ack_inbox / send_ack
+
+**inbox 是 Hub 向 Agent 投递任务的缓冲区**。Agent 节点通过 SSE 收到 `new_task` 事件后，调 `get_inbox` 拉取待处理任务，调 `ack_inbox` 确认收到。
+
+```
+# 1. 拉取 inbox
+get_inbox(alias: "my-agent", limit: 10)
+# 返回：messages 数组，每条含 id / content / from_session / priority
+
+# 2. 确认收到（消除 inbox 计数，触发 task 状态从 delivered → acked）
+ack_inbox(alias: "my-agent", message_id: "task_abc123")
+```
+
+`send_ack` 和 `ack_inbox` 的区别：
+
+| 工具 | 作用 | 是否消除 inbox 计数 |
+|---|---|---|
+| `ack_inbox` | 确认 inbox 里的消息已读 | ✅ |
+| `send_ack` | 更新 task 状态为 acked（不进 inbox） | — |
+
+anet 的 agent-node 自动处理 `get_inbox` + `ack_inbox` 的流程，Agent 节点正常运行时不需要你手动调。但如果你自己用 SDK（`CommHub` class）写 Agent，需要在处理任务前主动 ack，否则 Dashboard 上 inbox_count 不归零，会让人误以为有任务积压。
+
+### 3.10 `report_completion` — 带产出物的完成上报
+
+`report_completion` 是 `commhub_reply(status="completed")` 的加强版，多了结构化产出物字段：
+
+```
+report_completion(
+  alias: "reviewer-1",
+  task: "审查 PR #42 的安全问题",
+  result: "发现 2 个 SQL 注入风险，详见 REPORT.md",
+  artifacts: ["./REPORT.md", "https://internal.example.com/report/42"],
+  score: 8,
+  duration_minutes: 3.5
+)
+```
+
+`artifacts` 字段是 URL 或本地路径数组，Dashboard Completions 面板可以直接点击访问。`score` 是 Agent 自评，可以用于后续效果统计。
+
+**什么时候用 `report_completion` 而不是直接 `commhub_reply`？**
+
+任务产出有明确文件 / URL，或者你需要用 Dashboard 统计 Agent 效果时。纯文字结果只需 `commhub_reply` 即可。
+
+---
+
+## 4. Agent 怎么调这些工具
+
+### 4.1 MCP 工具注入原理
+
+当 `anet node start my-agent` 启动 Agent 时，agent-node 通过 MCP stdio 向 LLM 注入 5 个内置工具（`commhub_reply` / `commhub_report_status` / `commhub_send_task` / `commhub_send_message` / `commhub_get_all_status`）。LLM 在对话中看到这些工具，就像看到普通的 Read / Write / Bash 一样，可以直接调用。
+
+Hub 把任务推送给 Agent 时，任务内容以 `<channel source="commhub" task_id="..." priority="..." from="...">` 格式出现在对话里。Agent 完成任务后调 `commhub_reply(task_id="...", text="...", status="completed")`，agent-node 把它转发给 Hub，Hub 通知发起方。
+
+### 4.2 对话里看到的实际样子
+
+以 Claude Code CLI runtime 为例，Agent 收到任务时对话里会出现类似这样的内容（不同 runtime 格式略有差异）：
+
+```
+<channel source="commhub" task_id="task_abc123" priority="normal" from="orchestrator">
+请帮我分析 ./src/auth.ts 的安全问题，输出 Markdown 报告
+</channel>
+```
+
+Agent 处理完后调：
+
+```
+commhub_reply({
+  "task_id": "task_abc123",
+  "text": "已完成安全审查，发现 3 个潜在风险：1) ...",
+  "status": "completed"
+})
+```
+
+agent-node 收到后：① 调 Hub 的 `send_reply`；② 调 `report_status(status="idle")`。发起方通过 SSE 收到任务结果通知。
+
+---
+
+## 5. 两个 Agent 互相派活的最小例子
+
+这是本节的核心：用最少的命令验证 A → B 的完整一次派活循环。
+
+**前置**：Hub 在 `:9200`，已创建两个节点 `agent-a` 和 `agent-b`，两个都已 `anet node start`（SSE = ●）。
+
+### 5.1 从 CLI 手动派一条任务给 agent-b
+
+```bash
+TOKEN=$(python3 -c "import json; d=json.load(open('$HOME/.anet/config.json')); print(d['token'])")
+NET="<你的 network_id，从 /api/auth/me 取>"
+
+# 派任务（单次调用，无需预先 initialize）
+curl -s -X POST http://127.0.0.1:9200/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"send_task\",\"arguments\":{\"alias\":\"agent-b\",\"task\":\"用一句话介绍 anet 的核心功能\",\"network_id\":\"$NET\"}}}"
+```
+
+返回 `{"ok":true,"message_id":"<task_id>","session_status":"idle/unknown/..."}` ，记下 `message_id` 即 task_id。
+
+### 5.2 查任务结果
+
+agent-b 处理完后调 `commhub_reply(status="completed")`，用 `get_task` 查结果：
+
+```bash
+curl -s -X POST http://127.0.0.1:9200/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_task","arguments":{"task_id":"<task_id>"}}}'
+```
+
+`status` 变为 `replied` 后，`result` 字段里就是 agent-b 的回复内容。若 agent-b 离线，`status` 停在 `delivered` 直到 TTL 到期变 `expired`。
+
+### 5.3 Agent-A 的视角：让 A 主动派给 B
+
+如果你想让 agent-a 在对话里自己派活给 agent-b，在 agent-a 的会话里提示：
+
+```
+先用 commhub_get_all_status 确认 agent-b 在线，然后用 commhub_send_task 把以下任务派给它：
+「用一句话介绍 anet 的核心功能」
+等 agent-b 回复后，用 get_task 查结果并告诉我。
+```
+
+agent-a 会：
+1. 调 `commhub_get_all_status()` → 看到 agent-b 状态是 `idle`
+2. 调 `commhub_send_task(alias="agent-b", task="...")` → 拿到 task_id
+3. 轮询等待结果：反复调 `get_task(task_id="...")` 直到 `status` 变为终态（`replied` / `failed` / `cancelled`），再读 `result` 字段
+
+> **`parent_task_id` 的工程影响**：`parent_task_id` 机制把子任务结果逐级 UPDATE 到每个祖先任务的 `result` 字段，并以 `[via <alias> 子任务结果]` marker 穿过中间层，最终以 SSE `chained_reply` 事件推给根任务发起方（通常是人或 Dashboard）。链路深度上限为 5 级，超过后不再传播。
+>
+> **重要**：commhub-server 把 `chained_reply` 推给父任务的 `from_name`（即原始发起方），是否把这条通知注入 agent 对话由 agent-node 决定——这不在 commhub-server 的职责范围内。因此 agent-a（orchestrator）在对话里**看不到** agent-b 子任务完成的自动通知，仍需用 `get_task` 轮询来拿结果。这是当前设计的已知工程权衡，不是 bug。
+
+---
+
+## 6. 常见坑与注意事项
+
+### 6.1 alias 必须精确匹配
+
+`send_task(alias="reviewer 1")` 和 `send_task(alias="reviewer-1")` 是两个不同的目标。alias 在 `anet node create` 时设定，区分大小写，空格和连字符不等价。
+
+**alias 拼错时 Hub 的行为**（实测 `commhub-server@0.8.2`）：Hub 静默接受、立即写 `delivered`、返回 HTTP 200 + `ok:true`，不报错。因为无人 ack，任务在 `delivered` 状态停留，直到 `ttl_seconds`（默认 3600 秒）到期后转为 `expired`。这是已知 open issue [#172](https://github.com/sleep2agi/agent-network/issues/172)：Hub 目前没有在 `send_task` 时校验目标 alias 是否已注册。
+
+先 `get_all_status` 看一眼实际的 alias 再 `send_task`。
+
+### 6.2 `send_task` 不等于任务立刻被执行
+
+`send_task` 只是把任务投进目标 Agent 的 inbox，状态变为 `delivered`。Agent 需要在线（SSE 连接存在）且空闲才会从 inbox 取任务处理。如果 agent-b 是 `offline`，任务在 inbox 里等到 TTL 过期（默认 1 小时）。
+
+排查步骤：`get_session_status(alias="agent-b")` 确认在线 → `list_tasks(alias="agent-b", status="delivered")` 确认任务已投递 → 如果 agent-b offline 则 `retry_task` 或 `reassign_task`。
+
+### 6.3 `commhub_reply` 里的 task_id 从哪来
+
+Agent 收到任务时，channel 消息格式是：
+
+```
+<channel source="commhub" task_id="task_abc123" ...>
+```
+
+`task_id` 就在这个 tag 里。如果 Agent 调 `commhub_reply` 时填错了 task_id（或者填了 `"hub"` 这个特殊值），结果就发不到正确的发起方。`"hub"` 是 agent-node 里的回退值，当无法确定发给谁时用，正常任务不应该用它。
+
+### 6.4 Dashboard 状态滞后不等于 Agent 挂掉
+
+`report_status` 心跳是 best-effort。网络抖动导致心跳失败时，节点日志会有 `heartbeat failed` 警告，任务执行不中断，Dashboard 状态最长滞后一个心跳周期（约 3 分钟）。判断 Agent 是否真正在线：看 `anet node ls` 的 `SSE` 列（● = 连通），不要只看 `STATUS` 列。
+
+---
+
+## 总结
+
+本节做了四件事：
+
+1. **厘清两套工具集**：CommHub Server 侧 17 个工具（无前缀）和 Agent 内置 5 个工具（`commhub_` 前缀），两者的关系是"内置工具调 Server 工具"。
+
+2. **全工具分类**：派活（`send_task` / `send_message` / `broadcast`）、查询（`get_all_status` / `get_session_status` / `get_task` / `list_tasks` / `get_completions`）、回复（`send_reply` / `send_ack` / `get_inbox` / `ack_inbox`）、状态（`report_status` / `report_completion` / `retry_task` / `cancel_task` / `reassign_task`）——17 个全部归类。
+
+3. **核心工具深挖**：`send_task` 参数表（含 `parent_task_id` 和 `ttl_seconds`）、`commhub_reply` 的 status 语义（终态 vs 非终态）、`send_task` vs `send_message` 的选择标准。
+
+4. **两 Agent 派活例子**：从 CLI 用 curl 直接调 MCP API、查任务状态，以及 Agent-A 在对话里自己调 `commhub_send_task` 派给 Agent-B 的完整流程。
+
+下一节：多 Agent 派活翻车诊断——task ID 漂移、路由失败、alias 冲突三类问题的 playbook，以及怎么用 SQLite `~/.commhub/commhub.db` 追完整任务链路。
+
+---
+
+## 附录：17 个 MCP 工具速查
+
+**派活类（3）**
+
+| 工具 | 必填参数 | 一句话 |
+|---|---|---|
+| `send_task` | `alias`, `task` | 向指定 Agent 派有生命周期的任务 |
+| `send_message` | `alias`, `message` | 向指定 Agent 发无生命周期的消息（纯通知）|
+| `broadcast` | `message` | 向全 network（或按 status 过滤）广播消息 |
+
+**查询类（5）**
+
+| 工具 | 必填参数 | 一句话 |
+|---|---|---|
+| `get_all_status` | — | 看所有 Agent 当前状态 |
+| `get_session_status` | `alias` | 看指定 Agent 详细状态 |
+| `get_task` | `task_id` | 查单条任务详情和结果 |
+| `list_tasks` | — | 按条件过滤任务列表 |
+| `get_completions` | — | 查有 `report_completion` 记录的已完成任务 |
+
+**回复类（4）**
+
+| 工具 | 必填参数 | 一句话 |
+|---|---|---|
+| `send_reply` | `alias`, `text` | 回复任务（关联 `in_reply_to`，触发发起方通知）|
+| `send_ack` | `task_id` | 仅确认收到（不进 inbox，只改 task status）|
+| `get_inbox` | `alias` | 拉取自己待处理的 inbox 消息 |
+| `ack_inbox` | `alias`, `message_id` | 确认 inbox 消息已读（消除 inbox 计数）|
+
+**状态类（5）**
+
+| 工具 | 必填参数 | 一句话 |
+|---|---|---|
+| `report_status` | `resume_id`, `alias`, `status` | 上报自己状态（心跳 + 任务进度）|
+| `report_completion` | `alias`, `task`, `result` | 上报完成及产出物（含 artifacts / score）|
+| `retry_task` | `task_id` | 重置任务到 delivered，重入 inbox |
+| `cancel_task` | `task_id` | 取消进行中任务 |
+| `reassign_task` | `task_id`, `new_alias` | 把任务改派给另一个 Agent |
+
+> **版本说明（三层口径）**：① 产品发布版 v0.10.8；② anet npm 包 `@sleep2agi/agent-network` 稳定版 `@2.2.6`、preview 版 `@2.2.7-preview.N`（preview 不等于稳定版，勿混用）；③ CommHub Server npm 包 `@sleep2agi/commhub-server@0.8.2`，本节工具清单基于此版本 `/mcp` 端点 `tools/list` 实测直接查得。

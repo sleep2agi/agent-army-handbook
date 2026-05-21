@@ -1,0 +1,380 @@
+---
+title: "CommHub 架构 — 三进程一数据库怎么协作"
+order: 1
+estimated_minutes: 18
+---
+
+# CommHub 架构 — 三进程一数据库怎么协作
+
+> 一条 `send_task` 从 Agent A 发出，到 Agent B 接手——中间经过哪几层、落进哪张表、谁推、谁拉，本节全部拆开。
+
+## 0. 一句话先讲明白
+
+**anet 是三个进程共享一个 SQLite 数据库：CommHub Server 负责路由和持久化，Dashboard 负责可视化，Agent 负责执行——Agent 之间不直连，全部通过 Hub 转发。**
+
+理解这一点是 debug 多 Agent 问题的前提。当任务"卡住"时，你要知道是卡在哪个进程、哪张表的哪个状态——而不是盲目重启所有东西。
+
+---
+
+## 你将学到
+
+- 三进程（CommHub Server / Dashboard / Agent）+ 一数据库各自负责什么
+- 两条传输通道：MCP Streamable HTTP（`/mcp`）vs SSE（`/events/:alias`）的分工逻辑
+- 一条 `send_task` 完整走一遍的消息流（从发出到 ACK，经过哪几张表）
+- 任务状态机：`delivered → acked → replied`（以及 `cancelled / failed / expired`）
+- 为什么是 Mesh 而不是 DAG，以及 Mesh 带来的可观测性代价
+
+## 适合谁
+
+已经跑通 CH1（Hub 在 `:9200` 运行，至少一个节点 `SSE connected`），想理解"发出去的任务去哪了"的工程师。本节以概念为主，仅 §2.1 有少量可选 curl 自测——后续 L02 到 L04 的 debug 都依赖这个模型。
+
+---
+
+## 1. 三进程一数据库
+
+> CH0 L01 已给出三进程骨架和 anet 的基本定位。本节从 CH1 出发——你已把 Hub 跑起来、节点上线、Demo 跑过——现在把背后的通信机制拆开讲清楚。
+
+用一张图先把全局摆出来：
+
+```
+                 ┌─────────────────────────────────┐
+                 │     ~/.commhub/commhub.db        │
+                 │          (SQLite)                │
+                 │  tasks / sessions / inbox /      │
+                 │  task_events / networks / ...    │
+                 └───────────┬─────────────────────┘
+                             │ 读写
+              ┌──────────────┴──────────────┐
+              │                             │
+   ┌──────────▼──────────┐      ┌───────────▼──────────┐
+   │  CommHub Server     │      │  Dashboard           │
+   │  :9200              │      │  :3000               │
+   │                     │      │                      │
+   │  /mcp  (HTTP)       │      │  Web UI              │
+   │  /events/:alias     │      │  (读 DB + 订阅 Hub)   │
+   │  (SSE)              │      │                      │
+   └──────────┬──────────┘      └──────────────────────┘
+              │
+      ┌───────┴────────┐
+      │                │
+ ┌────▼─────┐    ┌─────▼────┐
+ │ Agent A  │    │ Agent B  │
+ │ (:node)  │    │ (:node)  │
+ └──────────┘    └──────────┘
+```
+
+### 1.1 CommHub Server（:9200）
+
+Hub 是唯一的中枢。它做三件事：
+
+1. **接收** Agent 发来的 MCP 工具调用（`send_task`、`report_status` 等）——通过 `/mcp` 端点，协议是 Streamable HTTP（MCP 规范 2025-03-26 版引入，支持 request/response 和服务端流式推送复用同一 POST 连接，区别于只能做请求/响应的普通 HTTP POST）。
+2. **推送** 任务和消息给目标 Agent——通过 `/events/:alias` 端点，协议是 SSE（Server-Sent Events，服务端主动推送）。
+3. **持久化** 所有任务、消息、Agent 状态到本地 SQLite（WAL 模式，即 Write-Ahead Logging）——落在 `~/.commhub/commhub.db`。
+
+三点要记住：
+- Agent 之间**没有直连**。A 不知道 B 的 IP，也不需要知道。所有通信经过 Hub 中转。
+- Hub 是**有状态**的。任务记录、Agent 状态、消息历史都在 SQLite 里。
+- Hub **崩溃重启后数据不丢**：SQLite WAL 模式保证未提交写入在重启时自动回放。重启期间在途的 MCP 调用（HTTP 层）会断连、Agent 侧报错；SSE 连接断开后 Agent 节点会自动重连（取决于 Agent 运行时的重试策略）；已写入数据库的任务状态保持不变，恢复后可继续处理。
+
+### 1.2 Dashboard（:3000）
+
+Dashboard 是一个独立进程，与 Hub 分开启动：
+
+```bash
+anet hub start       # 启动 CommHub Server（:9200）
+anet hub dashboard   # 启动 Dashboard（:3000）
+```
+
+Dashboard 通过 Hub 的 API 读数据，不直接读 SQLite（所以 Hub 不起来时 Dashboard 什么都看不到）。它是**只读的观测层**，不参与消息路由。
+
+> 实测提醒：Dashboard 的数据有轮询延迟，不是实时推送。如果你在 Dashboard 看到的状态和 `anet node ls` 对不上，稍等几秒刷新，或者直接查 SQLite 拿最新状态（CH2-L03 展开）。
+
+### 1.3 Agent 节点
+
+Agent 是实际执行任务的进程。它做两件事：
+
+1. 启动时连上 Hub 的 SSE 通道（`/events/{alias}`），保持长连接，等待 Hub 推任务过来。
+2. 执行任务时，调 Hub 的 MCP 工具——`report_status` 报进度、`send_task` 往外派子任务、`send_reply` 回复结果。
+
+Agent 自己**不**主动轮询"有没有新任务"——Hub 通过 SSE 主动推。这就是为什么 `anet node ls` 里 `SSE=●` 是节点在线的关键指标：SSE 断了，Agent 收不到新任务，但它不会知道自己已经离线。
+
+### 1.4 SQLite：`~/.commhub/commhub.db`
+
+所有状态的最终来源（source of truth）。实测当前库 16 张表（15 用户表 + `sqlite_sequence`），核心的四张：
+
+| 表 | 存什么 |
+|---|---|
+| `tasks` | 每条任务的完整记录：从/到谁，内容，状态，时间戳，父任务 ID |
+| `sessions` | 每个 Agent 的当前状态：alias、`agent`（存 "claude-code" / "agent-node:codex" 等字符串）、在线状态、最后心跳时间、资源用量 |
+| `inbox` | 已投递但尚未处理的任务队列（Agent ACK 后条目不删除，只打标记） |
+| `task_events` | 任务状态变迁流水账：每次状态变化都记一行（`delivered → acked → replied`） |
+
+`~/.commhub/commhub.db-shm` 和 `commhub.db-wal` 是 SQLite WAL 模式（Write-Ahead Logging）的附属文件，Hub 正常运行时始终存在，不需要手动处理。
+
+---
+
+## 2. 两条传输通道
+
+两个端点，两个方向，两种协议，职责不重叠。
+
+### 2.1 MCP Streamable HTTP：`/mcp`（Agent → Hub）
+
+MCP（Model Context Protocol）是 AI 工具调用的标准协议。Agent 调用 Hub 提供的 17 个 MCP 工具，全部走 `POST /mcp`，协议是 **Streamable HTTP**（MCP 规范 2025-03-26 版引入）。
+
+实测：该端点需要同时接受 `application/json` 和 `text/event-stream`：
+
+```bash
+# 正确：两个 Content-Type 都要声明
+curl -X POST http://127.0.0.1:9200/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "Authorization: Bearer ${YOUR_NTOK}" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+
+# 错误：少了 text/event-stream，Hub 返回 -32000 Not Acceptable
+curl -X POST http://127.0.0.1:9200/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \   # ← 不够
+  ...
+```
+
+（直接用 MCP 客户端时这些头由 SDK 自动加，只在手动 `curl` 调试时需要注意。）
+
+17 个 MCP 工具按用途分五类（L02 逐个讲，这里先建分类认知）：
+
+| 类别 | 工具（实测） |
+|---|---|
+| 派活 / 发送 | `send_task` / `send_message` / `broadcast` |
+| 回复 / 确认 | `send_reply` / `send_ack` |
+| 查询 | `get_all_status` / `get_session_status` / `get_inbox` / `get_task` / `list_tasks` / `get_completions` |
+| 状态上报 | `report_status` / `report_completion` / `ack_inbox` |
+| 任务管理 | `retry_task` / `cancel_task` / `reassign_task` |
+
+> `send_message` 的 MCP 描述是 "Send a message to a session (no task lifecycle, just chat)"——它会进对方 inbox、也触发 SSE 推送，但不创建任务、不产生 `task_events`（没有任务生命周期）。归派活/发送类，不是回复类。
+
+这 17 个工具是 Agent 的全部通信接口——**Agent 对外做的所有事，都通过这 17 个工具表达**。包括你作为人类用 MCP 客户端（比如 Claude Code）连上 Hub 时，也是同一套工具。
+
+### 2.2 SSE：`/events/:alias`（Hub → Agent）
+
+SSE（Server-Sent Events）是 HTTP/1.1 的标准机制：客户端保持一个长连接，服务端随时往里 push 数据，单向。这就是 Hub 主动推任务给 Agent 的通道。
+
+每个 Agent 启动时连接 `/events/{自己的alias}`，保持这条长连接——这就是 `anet node ls` 里 `SSE=●/○` 的含义：
+
+- `●`：SSE 长连接活跃，Hub 能推任务进来
+- `○`：连接断开，Agent 进程可能下线，或者网络异常
+
+> 实测：`/events/:alias` 端点需要 **network-scoped token**（`ntok_` 前缀），不能用普通用户 token（`utok_`）。直接用 `curl` 访问时会返回 `{"error":"network-scoped token required for SSE"}`。Agent 节点自动处理这套认证，日常不需要手动操作——只在 debug 时知道这个区别有用。两种 token 的完整权限模型见 §5，多用户 RBAC 见 CH4 L03。
+
+**为什么不用轮询？** Agent 数量多的时候，轮询开销随节点数线性增长；SSE 是服务端 push，连接开销恒定，Hub 有新任务时才发数据，空闲时零流量。当前本机实测 62 个 SSE 连接同时保持正常运行，资源占用不明显。
+
+### 2.3 两个端点职责对比
+
+```
+/mcp（Streamable HTTP）                /events/:alias（SSE）
+─────────────────────────────────     ─────────────────────────────────
+方向：Agent → Hub                      方向：Hub → Agent
+发起：Agent 主动调                      发起：Agent 启动时 connect，然后等推
+协议：HTTP POST，request/response       协议：HTTP GET，长连接，event stream
+用途：17 个 MCP 工具调用                用途：Hub 把新任务推给 Agent
+认证：user token 或 node token          认证：network-scoped node token
+```
+
+---
+
+## 3. 一条 `send_task` 走一遍
+
+把两条传输通道和数据库放在一起，看一条任务的完整旅程。
+
+**场景**：Agent A 调 `send_task`，把一个任务派给 Agent B。
+
+```
+Agent A                Hub Server              SQLite              Agent B
+  │                        │                     │                   │
+  │  POST /mcp             │                     │                   │
+  │  send_task{            │                     │                   │
+  │    alias: "B",         │                     │                   │
+  │    task:  "..."        │                     │                   │
+  │  }                     │                     │                   │
+  │ ─────────────────────> │                     │                   │
+  │                        │ INSERT tasks        │                   │
+  │                        │ (status=delivered)  │                   │
+  │                        │ ──────────────────> │                   │
+  │                        │ INSERT task_events  │                   │
+  │                        │ (None→delivered)    │                   │
+  │                        │ ──────────────────> │                   │
+  │                        │ INSERT inbox        │                   │
+  │                        │ ──────────────────> │                   │
+  │  返回 {task_id}         │                     │                   │
+  │ <───────────────────── │                     │                   │
+  │                        │                     │                   │
+  │                        │ SSE event: task     │                   │
+  │                        │ push to /events/B   │                   │
+  │                        │ ─────────────────────────────────────> │
+  │                        │                     │                   │
+  │                        │                     │   ack_inbox       │
+  │                        │ <───────────────────────────────────── │
+  │                        │                     │                   │
+  │                        │ UPDATE tasks        │                   │
+  │                        │ (status=acked)      │                   │
+  │                        │ ──────────────────> │                   │
+  │                        │ INSERT task_events  │                   │
+  │                        │ (delivered→acked)   │                   │
+  │                        │ ──────────────────> │                   │
+  │                        │                     │                   │
+  │                        │                     │   [B 执行任务]    │
+  │                        │                     │                   │
+  │                        │                     │   send_reply      │
+  │                        │ <───────────────────────────────────── │
+  │                        │                     │                   │
+  │                        │ UPDATE tasks        │                   │
+  │                        │ (status=replied)    │                   │
+  │                        │ ──────────────────> │                   │
+  │                        │ INSERT task_events  │                   │
+  │                        │ (None→replied)      │                   │
+  │                        │ ──────────────────> │                   │
+  │                        │                     │                   │
+  │                        │ SSE event: reply    │                   │
+  │ <───────────────────────────────────────────────────────────── │
+  │                        │                     │                   │
+```
+
+关键细节：
+
+**`send_task` 是非阻塞的。** Hub 写完数据库、往 SSE 推完，立即返回 `task_id` 给 Agent A。A 拿到 `task_id` 后可以继续做其他事，也可以用 `get_task` 轮询状态，或者等 Hub 把回复推过来。
+
+**`ack_inbox` 是 Agent B 告诉 Hub "我收到了"。** 这一步只更新 `tasks.status` 为 `acked`，不代表任务执行完。任务执行完后，B 调 `send_reply`，Hub 再把 `tasks.status` 更新为 `replied`，同时把回复 push 给 A。
+
+**`task_events` 是流水账，不更改，只追加。** 每次状态变化都插一行。这是事后追查任务链路的唯一可靠依据——即使任务最终失败或被取消，流水账还在。
+
+### 3.1 任务状态机
+
+实测 `tasks.status` 的实际取值：
+
+```
+           ┌─────────────────────────────────────────┐
+           │                                         │
+  创建时    │  (none) ──────> delivered               │
+           │                     │                   │
+           │                     ▼                   │
+           │                  acked                  │
+           │                 ╱     ╲                 │
+           │                ▼       ▼                │
+           │             replied  running            │
+           │                                         │
+  终态      │     cancelled  /  failed  /  expired   │
+           │                                         │
+           └─────────────────────────────────────────┘
+```
+
+| 状态 | 含义 |
+|---|---|
+| `delivered` | Hub 已写入数据库并推给 Agent，等待 ACK |
+| `acked` | Agent 确认收到（`ack_inbox` / `send_ack`），开始处理 |
+| `running` | Agent 正在处理（可选，部分 Agent 上报） |
+| `replied` | Agent 已回复结果（`send_reply`），任务完成 |
+| `cancelled` | 被 `cancel_task` 取消（只能在非终态时操作） |
+| `failed` | Agent 上报失败（`report_completion` 带 `failed` 状态） |
+| `expired` | 超过 `ttl_seconds`（默认 3600 秒）未被 ACK，Hub 自动过期 |
+
+状态机从 `(none)` 直接到 `delivered`：`tasks` 表 DDL 里 `status` 的 DEFAULT 是 `'created'`，但实测 `task_events` 表里从未出现 `from_status='created'` 或 `to_status='created'`（0 行）。原因是 MCP `send_task` 路径在一个事务里直接把 `status` 写成 `'delivered'`，从不经过 `created` 这个中间态——`created` DEFAULT 只是 DDL 的保守兜底，正常派活路径不会触发。
+
+> 实测：本机 `commhub.db` 里出现过的状态值是 `acked / cancelled / expired / failed / replied / running`，与上表吻合。`delivered` 是瞬态，正常情况下任务很快被 Agent ACK，所以数据库里极少看到大量 `delivered` 状态——如果 `SELECT count(*) FROM tasks WHERE status='delivered'` 结果很大，说明有 Agent 长时间未 ACK，是 debug 的信号。
+
+---
+
+## 4. 为什么是 Mesh 而不是 DAG
+
+CH0 已对比过 DAG 工作流和 Mesh 的差异，这里只收尾最关键的工程含义。
+
+### 4.1 DAG vs Mesh 一句话差异
+
+DAG（LangGraph 等）：流程在代码里写死，A → B → C，有内置 step trace，失败时知道卡在第几步，可以精确重试；但流程必须提前设计好，灵活度低。
+
+anet Mesh：Hub 只管转发，Agent 根据提示词自主决定往哪派。适合"并行评审、汇总裁决"这类协作型任务——fan-out/fan-in 不需要显式定义，提示词写对了 Agent 自然就会这样做。代价是没有内置 step trace。
+
+### 4.2 Mesh 的可观测性盲区
+
+当 8 个 Agent 互相 `send_task` 时，任务链路是一棵树（或有向图），没有人维护这棵树——只有 `tasks.parent_task_id` 字段隐式记录了父子关系。重建任务链路的递归 SQL 见 L03；这里先记住：**Mesh 的 debug 工具是 SQLite 直查 + Dashboard Tasks 面板，不是 step trace。**
+
+---
+
+## 5. 认证：两种 Token
+
+这个架构里有两类凭据，后续 debug 时会用到：
+
+| Token 类型 | 前缀 | 用途 | 获取方式 |
+|---|---|---|---|
+| 用户 token | `utok_` | 用户操作 Hub（`anet login` 后存入 `~/.anet/config.json`） | `anet login` |
+| 节点 token | `ntok_` | Agent 节点连接 Hub（network-scoped） | `anet node create` 时自动写入节点 config |
+
+实测 `~/.anet/config.json` 结构（脱敏）：
+
+```json
+{
+  "hub": "http://127.0.0.1:9200",
+  "token": "utok_...",
+  "user": {
+    "user_id": "u_...",
+    "username": "admin",
+    "role": "admin"
+  },
+  "network_id": "net_...",
+  "network_name": "default"
+}
+```
+
+节点 config（`{cwd}/.anet/nodes/{name}/config.json`）里有独立的 `token`（ntok 前缀），SSE 连接用这个。
+
+两者的区别在 §2.2 已提到：`/events/:alias` 的 SSE 连接需要 ntok，不能用 utok。完整 token 模型与多用户 RBAC 见 CH4 L03。
+
+---
+
+## 总结
+
+本节建立了 anet 通信架构的全局心智模型：
+
+1. **三进程一数据库**：CommHub Server（:9200）做路由和持久化，Dashboard（:3000）做可视化，Agent 做执行，SQLite（`~/.commhub/commhub.db`，WAL 模式）是唯一的状态 source of truth；Hub 崩溃重启后 WAL 自动回放，数据不丢
+2. **两条传输通道**：`/mcp`（Streamable HTTP，Agent 主动调 17 个 MCP 工具）和 `/events/:alias`（SSE，Hub 主动推任务给 Agent）——方向相反，职责不重叠
+3. **一条任务的生命周期**：`(none) → delivered → acked → replied`，每步在 `task_events` 留一条流水账；`created` 只是 DDL DEFAULT，MCP 路径直接写 `delivered`
+4. **Mesh vs DAG**：自由派活适合协作类任务，代价是没有内置 step trace——debug 靠 SQLite 直查（递归链路 SQL 见 L03）
+
+这个模型是后续三节的基础：L02 把 17 个 MCP 工具逐个拆开，L03 讲 Mesh 派活的常见故障和诊断 playbook，L04 把 Agent 接进外部 IM。
+
+---
+
+## 附录：本节命令速查
+
+```bash
+# 启动两个进程（分开启动，分开端口）
+anet hub start        # CommHub Server → http://127.0.0.1:9200
+anet hub dashboard    # Dashboard     → http://127.0.0.1:3000
+
+# 确认 Hub 正常（health 端点无需认证）
+curl -s http://127.0.0.1:9200/health
+# 实测关键字段：{"ok":true,"version":"0.8.2","api_version":"v3",
+#   "transport":"streamable-http","sessions_count":84,"sse_connections":62,...}
+# version 字段是 commhub-server 组件版本，不是 anet CLI 版本
+
+# 查所有 Agent 的 SSE 连接状态
+anet node ls          # SSE=● 连接活跃 / SSE=○ 连接断开
+
+# 查最近任务（看任务状态流转）
+anet tasks
+
+# SQLite 快速直查（python3 内置 sqlite3，无需额外安装）
+python3 -c "
+import sqlite3, sys
+conn = sqlite3.connect('/home/${YOUR_USER}/.commhub/commhub.db')
+cur = conn.cursor()
+cur.execute('SELECT task_id,from_name,to_name,status,created_at FROM tasks ORDER BY created_at DESC LIMIT 10')
+for r in cur.fetchall(): print(r)
+"
+```
+
+**版本号三层口径**（三者独立迭代，数字之间没有对应关系）：
+
+| 层 | 查看方式 | 当前实测值 | 说明 |
+|---|---|---|---|
+| anet 产品发布版（umbrella） | 官方 changelog | v0.10.8 | 对外公示的产品里程碑版本 |
+| CLI npm 包（`@sleep2agi/agent-network`） | `anet -v` | 以实际装到的为准（`@latest` 为 2.2.6，`@preview` 通道会是 2.2.7-preview.N） | 不等于产品版本，不要叫"稳定版" |
+| commhub-server 组件 | `anet doctor` 或 `/health` 的 `version` 字段 | `0.8.2` | 独立 npm 包，只在 `doctor` / `health` 输出中出现 |

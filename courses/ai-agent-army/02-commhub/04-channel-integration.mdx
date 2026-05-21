@@ -1,0 +1,604 @@
+---
+title: "anet channel — 把 Agent 接到 Telegram（微信/飞书：替代方案与路线图）"
+order: 4
+estimated_minutes: 18
+---
+
+# anet channel — 把 Agent 接到 Telegram（微信/飞书：替代方案与路线图）
+
+> 让 Agent 在 Telegram 里待命，你发一条消息，它跑工具、改文件、调 MCP、回复结果——不用开 Dashboard，不用开终端。
+
+## 0. 一句话先讲明白
+
+**`anet channel` 把外部 IM 接成 Agent 的输入输出口。** 消息进来，Agent 处理，回复出去——你只需要在手机上发一条消息，Agent 军团就动起来了。
+
+> 当前 anet 原生支持的 channel 类型只有 **Telegram**。微信和飞书在路线图上，排期 v0.11+，当前版本无法通过 `anet channel add` 接入。本节末尾有替代方案说明。
+
+**本节 walkthrough 针对 claude-code-cli 节点的 Telegram 接入**（§2 起逐步引导）；codex-sdk / claude-agent-sdk 节点走 agent-node 内置 long-polling，不需要装 claude plugin，见本节 §2.1 末尾简述。
+
+---
+
+## 你将学到
+
+- channel 架构是什么：消息怎么从 Telegram 进 Agent、回复怎么出去
+- `anet channel add telegram <node>` 完整走一遍，含各参数的含义和坑
+- 落盘文件结构：`access.json` + `.env` 各字段语义
+- `anet channel ls` 三种情况的实际输出（含无 channel 节点的行为）
+- 节点必须重启才能让 channel 生效，以及为什么
+- 常见故障诊断
+- 微信 / 飞书现状与替代方案
+
+## 适合谁
+
+已跑通 CH1（Hub 在 `:9200` 运行，至少有一个 `claude-code-cli` 节点上线），想把 Agent 接进手机 IM 随时随地发指令的读者。
+
+想用微信 / 飞书的读者可以直接跳到 §10。
+
+---
+
+## 1. channel 是什么，消息流怎么走
+
+在 anet 里，Agent 默认有两条输入输出路径：
+
+1. **CommHub SSE**（`server:commhub`）—— 其他 Agent 通过 `send_task` 给它派活，Hub 主动推。这条每个节点默认有。
+2. **外部 channel**（如 `telegram`）—— 你在 Telegram 里发消息，Agent 收到、处理、回复。需要手动配置。
+
+**关键架构事实**：agent-node 使用 Telegram **long-polling**（主动轮询），不是 webhook。因此 Agent 节点不需要公网 IP——本地网络能访问 `api.telegram.org` 即可。消息延迟取决于消息到达时距下一次 `getUpdates` poll 返回的时机：poll 窗口是 30 秒（`getUpdates?timeout=30`，源码 `agent-node/src/cli.ts:1326`），消息在 0–30 秒内被取走，实际中位数在个位秒级。
+
+一条 Telegram 消息的完整生命周期：
+
+```
+你（Telegram DM）
+  ↓
+@BotFather 创建的 Bot（bot token 控制）
+  ↓  long-polling（不是 webhook，无需公网 IP）
+agent-node 内置 Telegram handler
+  ↓
+消息被包成 XML 注入 LLM 上下文：
+  <channel source="telegram" chat_id="123456" user="alice" ts="...">
+    写一个快排算法
+  </channel>
+  ↓
+LLM 生成回复文本
+  ↓
+agent-node 内部 telegramSend() 自动分段发回 Telegram
+（4096 字符自动切块，reply_to_message_id 关联首段）
+```
+
+**Agent 不需要懂 Telegram API**。没有 `telegram_reply` MCP 工具给 Agent 调——Agent 只需要输出回复文本，handler 自动转发。旧版文档列过 `telegram_reply` / `telegram_edit_message` 等工具，全部查无此实现，已更正。
+
+CommHub 的 `server:commhub` channel 是另一条独立的 SSE 长连接，和 Telegram polling 并行跑在同一个进程里，共享同一个 LLM 实例。**但 LLM 一次只处理一条消息**——如果 Agent 正在处理 CommHub 的长任务，Telegram 消息会排队等待。agent-node 在内存里维护一个串行处理队列；Telegram 服务端本身会保留未取走的消息（Telegram Bot API 官方文档规定保留期为 24 小时），超出保留期的旧消息会被 Telegram 服务端丢弃，不会被 poll 取到。
+
+---
+
+## 2. 前置条件
+
+### 2.1 两套 Telegram 架构，按 runtime 分
+
+anet 当前版本有**两条**完全不同的 Telegram 实现路径，都是生产可用状态（不是路线图、不是废弃）：
+
+| Runtime | Telegram 实现 | 谁来跑 Telegram |
+|---|---|---|
+| `claude-code-cli` | `claude` CLI 的 `telegram@claude-plugins-official` plugin | anet 启动 `claude`，传 `--channels plugin:telegram@claude-plugins-official` + 设 `TELEGRAM_STATE_DIR` 环境变量（源码 `agent-network/bin/cli.ts:2241/2249-2250/2291`） |
+| `codex-sdk` / `claude-agent-sdk` | agent-node **内置 long-polling**（`getUpdates?timeout=30`） | anet 启动 `agent-node`，agent-node 读 config.json 的 channels 数组，自己跑内置轮询（源码 `agent-node/src/cli.ts:1326`）。`demos/codex-telegram-squad` 就是 codex-sdk + Telegram 内置路径 |
+
+```bash
+anet node ls
+```
+
+看 RUNTIME 列，确认你要配的节点是哪条路径。三种 Runtime 的完整对比见 CH3 L01。
+
+**本节 walkthrough 走 claude-code-cli 路径**（§2.2 起）。codex-sdk / claude-agent-sdk 路径见本节末尾段落，不展开为主线——两条路都**现在就能用**。
+
+如果没有 `claude-code-cli` 节点，先建一个：
+
+```bash
+anet node create 指挥室 --runtime claude-code-cli
+```
+
+### 2.2 claude CLI 版本要求 >= 2.x
+
+channel 接入依赖 Claude Code CLI 的 plugin 系统：
+
+```bash
+claude --version
+```
+
+版本需要支持 `--channels plugin:xxx@yyy` 语法。`claude` CLI v2.x 开始支持（本机实测 v2.1.146 正常）。
+
+### 2.3 安装 telegram plugin（claude-code-cli runtime 专用，一次性，全机共享）
+
+**此步骤仅适用于 `claude-code-cli` runtime。** codex-sdk / claude-agent-sdk 节点走 agent-node 内置 long-polling，不需要装任何 plugin，可跳过本节。
+
+`anet channel add telegram` 写配置；claude-code-cli runtime 实际跑 Telegram 的是 Claude Code 的 telegram plugin。这个 plugin 需要提前装一次：
+
+```bash
+# 检查是否已装
+claude plugin list | grep telegram
+```
+
+已装的输出示例：
+
+```
+  ❯ telegram@claude-plugins-official
+    Version: 0.0.6
+    Scope: user
+    Status: ✔ enabled
+```
+
+没装则安装：
+
+```bash
+claude plugin install telegram@claude-plugins-official
+```
+
+安装后 plugin 落盘在 `~/.claude/plugins/cache/claude-plugins-official/telegram/0.0.6/`。这是 user scope，一台机器装一次，所有 anet 节点共用。
+
+**跳过这步会怎样**（claude-code-cli 节点）：plugin 未加载，Telegram 消息静默丢失，没有任何报错。确认 plugin 是否在跑的方法是在 tmux 会话里观察 Claude 启动后有无 Telegram 相关提示，或发一条测试消息等 10 秒看是否有回复。
+
+---
+
+## 3. 拿 Bot Token + 数字 User ID
+
+Bot Token 在 Telegram 的 @BotFather 里创建（`/newbot` 命令）。User ID 在 @userinfobot 里拿。完整操作见 [Telegram Bot 官方文档](https://core.telegram.org/bots)。
+
+非显然点：
+
+- `--allow` 接受的是**数字 user ID**，不是 `@username`。用 username 白名单会失效且不报错。
+- 拿别人的数字 user ID：让对方 DM 你的 bot 发任意消息，然后看 inbox：
+
+```bash
+ls -lt .anet/nodes/指挥室/channels/telegram/inbox/
+cat <最新的 .json 文件> | python3 -m json.tool | grep -E 'chat_id|from'
+```
+
+- Telegram 消息发送格式：Telegram Bot API 官方文档规定，MarkdownV2 模式下 `_`、`[`、`]`、`(`、`)`、`~`、`` ` ``、`>`、`#`、`+`、`-`、`=`、`|`、`{`、`}`、`.`、`!` 等字符必须用反斜杠转义，未转义会导致 Telegram API 返回 400 拒绝发送。Agent 输出纯文本时通常不触发这个问题；如果 bot 对某条消息无回复且日志里有 400 错误，检查文本里是否有未转义的特殊字符。
+
+---
+
+## 4. `anet channel add telegram` 走一遍
+
+```bash
+anet channel add telegram 指挥室 \
+  --bot-token 7123456789:AAEhBP_xyzABC... \
+  --allow 123456789
+```
+
+参数说明：
+
+| 参数 | 必填 | 说明 |
+|---|---|---|
+| `telegram` | 是 | channel 类型，当前唯一支持值 |
+| `指挥室` | 是 | 节点 alias（名称），两者等价 |
+| `--bot-token <tok>` | 是 | BotFather 给的 bot token |
+| `--allow <user-id>` | 是 | 你的 Telegram 数字 user ID，加进白名单 |
+
+**交互式模式**（适合 token 不想出现在 shell history）：
+
+```bash
+anet channel add telegram 指挥室
+# → Telegram Bot Token: <隐藏输入>
+# → Allow User ID (发 @userinfobot 获取数字ID): <输入>
+```
+
+正常输出：
+
+```
+✅ telegram channel added to "指挥室"
+/home/<user>/blueleap/.anet/nodes/指挥室/channels/telegram/
+config.json updated
+```
+
+注意输出里的路径是按**节点 alias**（`指挥室`）命名的目录，不是 `n_xxx` 格式的 node_id。node_id（`n_f420874b` 这类）只是 `config.json` 内部的唯一标识字段，不用作目录名。
+
+常见错误：
+
+| 错误信息 | 原因 | 解决 |
+|---|---|---|
+| `Node "指挥室" not found.` | 节点名字打错或不存在 | `anet node ls` 查正确名字 |
+| `P0 only supports telegram channels. Unsupported type: <X>` | channel 类型不是 telegram | 改成 `telegram` |
+| `Error: bot-token and allow required` | 交互式时空回车 | 重跑命令认真输入 |
+
+---
+
+## 5. 验证落盘文件
+
+### 5.1 用 `anet channel ls` 检查
+
+```bash
+anet channel ls
+```
+
+实测输出格式（有 channel 时）：
+
+```
+Node Channels:
+
+  指挥室 (指挥室)    telegram     allow: 123456789
+```
+
+带 node name 过滤：
+
+```bash
+anet channel ls 指挥室
+```
+
+`anet channel ls <node-name>` 有三种情况，**实测**：
+
+| 情况 | 实际输出 | exit code |
+|---|---|---|
+| 节点存在，有 channel | 列出 channel 详情（含 allow 列表） | 0 |
+| 节点不存在 | `Node "指挥室" not found.` | 1 |
+| 节点存在，但没有 channel | `No channels. Add one: anet channel add telegram <node-id>` | 0 |
+
+**注意情况三**：有些读者预期"没有输出"，实际会看到提示文本——这是正常行为，不是 channel 未生效的 bug。
+
+### 5.2 落盘目录结构
+
+`anet channel add telegram` 在节点目录下创建：
+
+```
+.anet/nodes/指挥室/channels/telegram/
+├── .env          ← chmod 600，存 TELEGRAM_BOT_TOKEN
+├── access.json   ← 白名单策略
+└── inbox/        ← plugin 缓存收到的原始消息（.json / 图片文件）
+```
+
+目录路径按**节点 alias** 命名（`指挥室`），不是 `n_xxx` node_id。
+
+**`.env` 内容**（token 已脱敏）：
+
+```
+TELEGRAM_BOT_TOKEN=7123456789:AAEhBP_xyzABC...
+```
+
+这个文件 chmod 600，只有当前 user 能读，不进 git（`.anet/` 默认在 `.gitignore`），不上传 hub。
+
+**`access.json` 完整字段**：
+
+```json
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["123456789"],
+  "groups": {},
+  "pending": {}
+}
+```
+
+| 字段 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `dmPolicy` | `"allowlist"` / `"deny-all"` / `"allow-all"` | `"allowlist"` | DM 准入策略，`allowlist` = 只允许 `allowFrom` 里的 ID |
+| `allowFrom` | `string[]`（数字 ID） | `[你传的 --allow 值]` | 私聊白名单 |
+| `groups` | `{ <chat_id>: "active"\|"passive"\|"deny" }` | `{}` | 群聊规则，空 = 拒绝所有群聊 |
+| `pending` | `object` | `{}` | plugin 内部状态，无需手动改 |
+
+### 5.3 `config.json` 里的 channels 数组
+
+```bash
+cat .anet/nodes/指挥室/config.json | python3 -m json.tool | grep -A3 channels
+```
+
+应该包含：
+
+```json
+"channels": [
+  "server:commhub",
+  "telegram"
+]
+```
+
+`server:commhub` 是每个节点默认自带的 CommHub channel。`telegram` 是刚加的。两条 channel 在同一个进程里并行工作，互不干扰——Agent 通过 `<channel source="commhub">` 和 `<channel source="telegram">` 标签区分消息来源。
+
+---
+
+## 6. 重启节点让 channel 生效
+
+**当前版本不支持热加载 channel**。配置写完之后，必须重启节点才能让 Telegram 生效：
+
+```bash
+anet node stop 指挥室
+anet node start 指挥室
+```
+
+### 6.1 claude-code-cli runtime 的启动行为
+
+anet CLI 在 spawn `claude` 之前会打印几行诊断信息，然后进入 Claude Code CLI 自己的界面（`stdio: "inherit"`，anet 不代理任何 Claude 的输出）。实测可见的 anet 侧日志行（源码 `agent-network/bin/cli.ts:2129/2157`）：
+
+```
+[anet] Resuming session xxxxxxxx... for "指挥室" [claude-code-cli]...
+
+[anet] Token: ntok_xxx...
+```
+
+之后的所有输出由 `claude` CLI 自己控制，anet 不插入任何 `[anet] Spawning` / `Telegram plugin` 等字样——这些不是真实日志行。
+
+**如何确认 Telegram channel 参数已传入**：anet 在 spawn 前会将 `--channels plugin:telegram@claude-plugins-official` 追加到 `claude` 的命令行参数（源码 `:2249-2250`），`TELEGRAM_STATE_DIR` 设为 `.anet/nodes/指挥室/channels/telegram`（`:2241`）。这两个值在进程层面有效，但 anet CLI 不把它们 echo 为日志行。验证方法：
+
+```bash
+# 确认 .env 里有 token（文件存在 = channel add 成功写入了）
+cat .anet/nodes/指挥室/channels/telegram/.env | cut -c1-30
+# 发一条测试消息给 bot，看是否有回复（§7）
+```
+
+### 6.2 codex-sdk / claude-agent-sdk runtime 的启动行为
+
+这条路径由 `agent-node` 自己跑 Telegram long-polling，启动时会打印两行真实日志（格式 `[HH:MM:SS] [INFO ] [节点alias] 消息`，源码 `agent-node/src/cli.ts:1291/1323`）：
+
+```
+[HH:MM:SS] [INFO ] [指挥室] Telegram bot: @your_bot_username (Bot DisplayName)
+[HH:MM:SS] [INFO ] [指挥室] Telegram polling: /path/to/.anet/nodes/指挥室/channels/telegram
+```
+
+第一行说明 token 有效、getMe 通过；第二行说明 polling 循环已启动。看到这两行即可确认 Telegram 接入正常。
+
+> 热加载排期 v0.11+。当前每次改 `access.json` / bot token 都要重启节点。
+
+---
+
+## 7. 在 Telegram 里测试
+
+打开 Telegram，搜你刚创建的 bot username，点 Start，发一条消息：
+
+```
+你: 数一下 1 到 5
+Bot: 1, 2, 3, 4, 5
+```
+
+回复速度取决于 LLM provider 响应时间，通常 5-15 秒。
+
+### 7.1 没收到回复：4 步诊断
+
+**步骤 1 — 确认你在白名单**
+
+```bash
+cat .anet/nodes/指挥室/channels/telegram/access.json | python3 -m json.tool
+```
+
+`allowFrom` 里必须有你当前用的 Telegram 数字 ID。
+
+> **重要安全属性**：白名单外的消息被静默 ignore，**不进日志，不报错，完全无痕**。这意味着：如果 `allowFrom` 里有误加的用户，他们在你的 Agent 上执行命令时你不会立刻发现任何异常迹象。仔细管理白名单比任何其他安全措施都重要。
+
+不匹配则手编 `access.json` 的 `allowFrom` 数组（`--allow` 会覆盖整个数组，不是追加，见 §8.1），或重跑命令：
+
+```bash
+anet channel add telegram 指挥室 \
+  --bot-token <same-token> \
+  --allow <correct-id>
+anet node stop 指挥室 && anet node start 指挥室
+```
+
+**步骤 2 — 确认节点在线**
+
+```bash
+anet node ls | grep 指挥室
+```
+
+STATUS 列应该是 `idle` 或 `working`。不是则看日志：
+
+```bash
+anet logs 指挥室 | tail -30
+```
+
+**步骤 3 — 确认 Telegram channel 已激活**
+
+对于 **codex-sdk / claude-agent-sdk** 节点，agent-node 日志里会有明确的 `Telegram bot:` 和 `Telegram polling:` 两行（§6.2），可用以下命令确认：
+
+```bash
+anet logs 指挥室 | grep -i "telegram"
+```
+
+对于 **claude-code-cli** 节点，anet 不打印 Telegram 专属日志行（§6.1）。确认方法是检查 channel 文件是否正确写入，以及直接发测试消息（§7 正文）。如果 plugin 未加载，确认 `telegram@claude-plugins-official` 已安装（§2.3）。
+
+**步骤 4 — 验证 bot token 有效**
+
+```bash
+curl "https://api.telegram.org/bot${YOUR_BOT_TOKEN}/getMe"
+```
+
+返回含 bot username 的 JSON 说明 token 有效；`{"ok": false, "error_code": 401}` 说明 token 失效，去 BotFather 重新拿。
+
+---
+
+## 8. 三个常见配置场景
+
+### 8.1 多人团队共用一个 bot
+
+`--allow` 一次只传一个 ID，且**会覆盖** `allowFrom` 数组，不是追加。加第二个人直接手编 `access.json`——文件只有 6 行，不需要脚本：
+
+```bash
+# 打开编辑
+nano .anet/nodes/指挥室/channels/telegram/access.json
+# 或用 jq 一行搞定：
+jq '.allowFrom += ["987654321"]' \
+  .anet/nodes/指挥室/channels/telegram/access.json \
+  > /tmp/access_tmp.json \
+  && mv /tmp/access_tmp.json \
+       .anet/nodes/指挥室/channels/telegram/access.json
+```
+
+然后重启节点生效：
+
+```bash
+anet node stop 指挥室 && anet node start 指挥室
+```
+
+### 8.2 允许 bot 在群聊里响应
+
+默认 `groups: {}` = 拒绝所有群聊。要让 bot 在某个群里响应，直接手编 `access.json`：
+
+```json
+{
+  "dmPolicy": "allowlist",
+  "allowFrom": ["123456789"],
+  "groups": {
+    "-1001234567890": "active"
+  },
+  "pending": {}
+}
+```
+
+群 chat_id 拿法：把任意一条群消息转发给 `@userinfobot`，它会回 chat id（群 id 是负数，如 `-1001234567890`）。
+
+重启节点生效。`groups` 字段值含义：
+
+| 值 | 行为 |
+|---|---|
+| `"active"` | bot 主动响应该群所有 @提及 |
+| `"passive"` | 只响应 `/command` |
+| `"deny"` | 拒绝（同默认） |
+
+### 8.3 更换 bot token
+
+> **Gotcha**：每次执行 `anet channel add telegram` 都会**重写整个 `access.json`**——不只是覆盖 bot token，`groups` 和 `pending` 字段也会被重置为 `{}`，`allowFrom` 被 `--allow` 传入的单个 ID 覆盖。如果你在 §8.2 配了群聊规则，重跑 `anet channel add` 会把 `groups` 清空。
+
+换 token 的安全做法是**直接手编 `.env`**，不碰 `access.json`：
+
+```bash
+# 直接编辑 token，不重置 access.json
+nano .anet/nodes/指挥室/channels/telegram/.env
+# 把 TELEGRAM_BOT_TOKEN= 后面那行改成新 token
+```
+
+如果你确实要重跑 `anet channel add`，记得之后重新手补 `groups` 字段：
+
+```bash
+anet channel add telegram 指挥室 \
+  --bot-token <new-token> \
+  --allow <user-id>
+# ← access.json 现在被重置了，groups 空了
+# 重新手编补回 groups
+jq '.groups["-1001234567890"] = "active"' \
+  .anet/nodes/指挥室/channels/telegram/access.json > /tmp/a.json \
+  && mv /tmp/a.json .anet/nodes/指挥室/channels/telegram/access.json
+anet node stop 指挥室 && anet node start 指挥室
+```
+
+旧 token 记得去 BotFather `/mybots` → 选 bot → `Revoke current token`。
+
+---
+
+## 9. 安全清单
+
+> **最高优先级**：白名单外消息静默 ignore、不进日志——这是当前实现最危险的安全属性。误加的用户在你 Agent 上跑命令，你无法从日志发现。`allowFrom` 的每一个 ID 都要当作 root 权限来对待。
+
+1. **工作目录隔离**：节点以 `dangerouslySkipPermissions: true` 运行，意味着 `allowFrom` 里的任意用户都能让 bot 执行任意 bash 命令和改文件，**包括 `rm -rf` 等破坏性操作**。绝对不要在 `$HOME` 跑节点——一旦白名单泄露或误加陌生人，整个 home 目录都在风险敞口内。用独立的工作目录运行节点。
+
+2. **白名单严格管理**：`allowFrom` 只放可信用户。非白名单消息静默 ignore，不报错，不进日志——误加的人在 Agent 上跑命令时你不会立刻发现（同上述说明）。
+
+3. **Bot Token 不进 git**：`.anet/` 默认在 `.gitignore` 里，不要手动覆盖。
+
+4. **一个 bot token 只能一处 polling**：Telegram 限制一个 bot 同时只有一个 polling 进程。多个节点共用同一 token 会互抢消息，每条只到其中一个节点，不报错，行为不可预期——每个节点单建一个 bot。
+
+---
+
+## 10. 微信 / 飞书：现状与替代方案
+
+> 想用微信 / 飞书的读者：本节有你需要的信息，无需付费再等。
+
+**当前 v0.10.8 的实际状态**：`anet channel add` 只支持 `telegram`。执行 `anet channel add wechat` 或 `anet channel add feishu` 会看到：
+
+```
+anet channel add <type> <node-id> [options]
+
+Types:  telegram
+```
+
+微信和飞书的原生 `anet channel add` 支持排期 v0.11+。
+
+**现在能用的替代方案**：
+
+**微信**：通过一个不属于 anet 官方 4 个 npm 包（`agent-network` / `agent-node` / `commhub-server` / `dashboard`）的**外部 MCP 插件**直接对接微信 bot，不经过 CommHub、不走 `anet channel add`。接入后，agent-node 环境里会有 `mcp__wechat__wechat_reply` / `mcp__wechat__wechat_reply_image` 这两个 MCP 工具可供 Agent 调用。配置走插件侧。
+
+**飞书**：同理，通过外部 MCP 插件对接飞书 bot，工具名为 `mcp__feishu__feishu_reply` / `mcp__feishu__feishu_reply_image`，不走 `anet channel add`。
+
+**Docker 编队**：如果你想快速跑一套含 Telegram 的多 Agent 编队而不用一个个配置，看 `demos/codex-telegram-squad`：
+
+```bash
+cd demos/codex-telegram-squad
+cp .env.example .env
+# 填 MINIMAX_API_KEY + TELEGRAM_BOT_TOKEN + TELEGRAM_ALLOW_USER（单数，不是 ALLOWED_USERS）
+docker compose up -d
+```
+
+这个 demo 起多个节点（Codex 代码兵 + MiniMax 文案兵等），指挥节点接 Telegram，你在手机上发指令，军团自动分工。
+
+---
+
+## 10.1 codex-sdk / claude-agent-sdk 节点的 Telegram 接入（agent-node 内置路径）
+
+如果你的节点是 `codex-sdk` 或 `claude-agent-sdk` runtime，Telegram 走 **agent-node 内置 long-polling**，不需要装 `telegram@claude-plugins-official` plugin，整个 §2.3 可以跳过。
+
+接入步骤与 claude-code-cli 路径相同：`anet channel add telegram <节点名> --bot-token <tok> --allow <uid>` 写入配置文件，然后重启节点。agent-node 启动时读取 `config.json` 里的 `channels` 数组，发现 `"telegram"` 就自己跑内置 long-polling（`getUpdates?timeout=30`）。不需要任何外部 plugin，也不需要额外配置。
+
+启动后日志里会出现（来自 `agent-node/src/cli.ts:1291/1323`）：
+
+```
+[HH:MM:SS] [INFO ] [节点alias] Telegram bot: @your_bot_username (Bot Name)
+[HH:MM:SS] [INFO ] [指挥室] Telegram polling: /path/to/.anet/nodes/节点alias/channels/telegram
+```
+
+看到这两行说明 token 有效、polling 已启动。之后的消息流和白名单逻辑（`access.json` 的 `allowFrom` 等）与本节主线完全一致。`demos/codex-telegram-squad` 就是 codex-sdk + 这条路径的可直接跑的完整示例。
+
+---
+
+## 总结
+
+本节走完了 `anet channel` 的 Telegram 接入全流程：
+
+- 理解了两套 Telegram 架构：claude-code-cli 走 claude plugin，codex-sdk / claude-agent-sdk 走 agent-node 内置 long-polling（§2.1）——两条都是当前可用状态
+- 建立了 `anet channel add telegram` → 落盘文件 → 重启 → 验证 的完整链路（主线走 claude-code-cli）
+- 搞清楚了 `anet channel ls` 三种输出情况（特别是有节点无 channel 的实际提示文本）
+- 明确了 `access.json` 重写陷阱（§8.3），换 token 最安全的方式是直接编辑 `.env`
+- 了解了当前版本的限制（只支持 Telegram）和微信/飞书的替代路径
+
+agent-node 目录结构小结：配置全部落在 `.anet/nodes/<节点alias>/channels/telegram/`，alias 就是节点名称（如 `指挥室`），不是 `n_xxx` 格式的 node_id。
+
+---
+
+## 附录：本节命令速查
+
+```bash
+# 检查 telegram plugin 是否已装
+claude plugin list | grep telegram
+
+# 安装 plugin（一次性）
+claude plugin install telegram@claude-plugins-official
+
+# 绑定 Telegram channel 到节点
+anet channel add telegram <node-name> \
+  --bot-token ${YOUR_BOT_TOKEN} \
+  --allow <telegram-numeric-uid>
+
+# 交互式（token 不出现在 shell history）
+anet channel add telegram <node-name>
+
+# 查看所有节点的 channel
+anet channel ls
+
+# 查看指定节点的 channel（三种结果见 §5.1）
+anet channel ls <node-name>
+
+# 重启节点让 channel 生效
+anet node stop <node-name> && anet node start <node-name>
+
+# 验证 bot token 有效
+curl "https://api.telegram.org/bot${YOUR_BOT_TOKEN}/getMe"
+
+# 手动加第二个 user 进白名单（jq 方式，不触碰其他字段）
+jq '.allowFrom += ["<new-uid>"]' \
+  .anet/nodes/<node-name>/channels/telegram/access.json \
+  > /tmp/a.json && mv /tmp/a.json \
+  .anet/nodes/<node-name>/channels/telegram/access.json
+
+# 换 bot token（安全方式：只改 .env，不重写 access.json）
+nano .anet/nodes/<node-name>/channels/telegram/.env
+```
+
+---
+
+## 下一步
+
+- **本章 CH2 L3**：Mesh 派活翻车诊断 — 如果你的 Agent 接进 Telegram 后行为不对、任务链路追不到，回 [03-mesh-debug](./03-mesh-debug.mdx) 查 SQLite 追链路。
+- **CH4 多机部署**：把 Hub 放到公网，在任何地方指挥 Agent 军团——[04-multi-machine/02-public-tls](../04-multi-machine/02-public-tls.mdx)。
+- **CH5 Dashboard**：channel 消息流在 Dashboard Tasks 和 Messages 面板里的可见性——[05-dashboard/02-tasks-messages](../05-dashboard/02-tasks-messages.mdx)。
+- **anet 官方文档**：[anet.sh/guide/channels](https://anet.sh/guide/channels) + [anet.sh/cases/telegram-bind-claude-code-cli](https://anet.sh/cases/telegram-bind-claude-code-cli)（含完整 expected output + 6 类错误码诊断）。
