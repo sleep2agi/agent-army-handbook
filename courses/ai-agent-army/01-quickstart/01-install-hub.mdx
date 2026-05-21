@@ -1,0 +1,350 @@
+---
+title: "一行命令装好 anet，30 秒拉起本地 Hub"
+order: 1
+estimated_minutes: 15
+---
+
+# 一行命令装好 anet，30 秒拉起本地 Hub
+
+> Hub 跑起来那一刻，你就拥有了一个能让多个 AI Agent 互相派活的本地通信中枢——不上云，不注册，SQLite 在本地。
+
+## 0. 一句话先讲明白
+
+**`npm install -g @sleep2agi/agent-network` 装一个包，`anet hub start` 一行启动，CommHub Server 就在 `:9200` 跑起来了。** 后续所有 Agent 都向这个 Hub 注册、发任务、收推送——Hub 是整个 anet 系统的唯一核心。
+
+---
+
+## 你将学到
+
+- Node.js 版本要求为何是 22.13.0，低版本怎么出错
+- `anet hub start` 实际启动了什么进程，数据落在哪
+- `~/.commhub/commhub.db` 为什么是 anet "本地优先"的关键证据
+- `anet -v` / `anet --version` 的读法，以及 `anet doctor` 能告诉你什么
+- `commhub-server` 等组件为什么不需要手动安装，首次拉取时机是什么
+
+## 适合谁
+
+用 Claude Code 等单 Agent 工具跑过任务、想把工作量分给多个 Agent 并行处理的工程师。要求会基本命令行操作，Node.js 环境已经装过或知道怎么装。
+
+---
+
+## 1. 前置要求：Node.js >= 22.13.0
+
+anet 只需要一个运行时：Node.js。没有 Python，没有 venv，没有 CUDA。
+
+但版本有下限——**Node.js >= 22.13.0**。低版本会在安装时触发 `EBADENGINE` 警告：
+
+```
+npm warn EBADENGINE Unsupported engine {
+  package: '@inquirer/prompts@7.x',
+  required: { node: '>=22.13.0' },
+  current: { node: 'v20.x.x', npm: '...' }
+}
+```
+
+`EBADENGINE` 是 npm 的引擎版本校验错误——包声明了 `engines.node` 字段，当前 Node.js 不满足时抛出。它不是致命错误，安装会继续，但部分功能（尤其是交互式提示 `@inquirer/prompts`）可能出现渲染异常或运行时报错。
+
+### 检查和升级
+
+```bash
+node --version   # 查当前版本
+```
+
+如果低于 22.13.0，推荐用 `nvm` 升级：
+
+```bash
+nvm install 22
+nvm use 22
+node --version   # 确认 v22.x.x
+```
+
+没有 nvm 的话，去 [nodejs.org](https://nodejs.org) 下载 LTS（当前 v22.x）直接安装。
+
+> 如果你用的是公司管控机器，Node.js 版本由 IT 统一管理，走申请流程升级，或者在个人开发机上操作。
+
+---
+
+## 2. 安装 anet
+
+```bash
+npm install -g @sleep2agi/agent-network
+```
+
+安装完验证：
+
+```bash
+anet --version
+# 或：
+anet -v
+```
+
+两个命令输出**完全相同**——都是完整的 Components 版本报告，没有「短输出 vs 详细输出」之分：
+
+```
+anet v2.2.x
+（版本号以你实际装到的为准；npm 包版本与产品发布版 v0.10.8 是两套独立编号）
+
+Components (auto-fetched on first use, you don't need to install them manually):
+  ✓ agent-node v2.4.2
+    └ @anthropic-ai/claude-agent-sdk v0.2.141
+  ○ commhub-server — not installed yet (will fetch via npx on first use)
+
+Optional runtimes (install only what you'll use):
+  ✓ claude CLI v2.1.146
+  ✓ codex CLI v0.130.0
+
+Nothing is broken — components are fetched the first time you run:
+  anet hub start          # bootstraps commhub-server
+  anet node start <name>  # bootstraps agent-node
+```
+
+`anet` 是 `@sleep2agi/agent-network` 包注册的全局 CLI 入口。安装这一个包，你就有了 CLI 的全部命令——但 Hub 服务组件和 Agent 节点组件不会在这一步预下载，它们是**按需拉取**的（下一节解释原因）。
+
+---
+
+## 3. 启动 Hub
+
+```bash
+anet hub start
+```
+
+第一次执行时，anet 需要拉取 `commhub-server` 组件（通过 `bunx` 或 `npx`）。你会看到类似输出：
+
+```
+[anet] Fetching commhub-server via bunx...
+[anet] CommHub Server started on http://127.0.0.1:9200
+[anet] Admin account bootstrapped: admin / anethub
+[anet] Data: ~/.commhub/commhub.db
+```
+
+（实际输出格式以运行时为准，上面是示意行。）
+
+Hub 启动后会：
+
+1. 在 `:9200` 监听（默认绑定 `127.0.0.1`，只接受本机连接）
+2. 初始化 SQLite 数据库在 `~/.commhub/commhub.db`
+3. 自动 bootstrap 管理员账号 `admin`，默认密码 `anethub`
+
+Hub 是一个前台进程，保持终端窗口开着，或者用 `tmux` / `screen` 挂在后台。按 `Ctrl+C` 停止 Hub。
+
+> Hub 被强杀（`kill -9`）后 SQLite WAL 可能未完成 checkpoint。下次执行 `anet hub start` 时 anet 会自动恢复——如遇异常可参考 anet 文档中的 WAL recovery 说明。（该行为以 anet 实际版本为准，domain 待核。）
+
+用浏览器查看 Hub 实时状态，见 L04。
+
+### 3.1 组件按需拉取的设计理由
+
+`commhub-server`（Hub 服务本体）和 `agent-node`（Agent 节点进程）作为独立包管理，原因是它们的迭代频率不同——CLI 工具层变动慢，服务组件迭代快。这样设计让你不需要每次 CLI 更新都重新拉取全部依赖，也不需要预先安装你暂时不用的组件。
+
+`bunx` 是 Bun 运行时提供的包执行器（类似 `npx`），anet 优先用它是因为 `bunx` 的包缓存策略比 `npx` 更激进，重复启动时冷启动更快。如果本机没有安装 Bun，anet 会自动降级到 `npx`。
+
+---
+
+## 4. 数据落在哪：本地优先不上云
+
+Hub 运行产生的所有数据，全部写入本机的一个 SQLite 文件：
+
+```
+~/.commhub/commhub.db
+```
+
+实测（本机）：
+
+```bash
+ls -lh ~/.commhub/
+# commhub.db      35M
+# commhub.db-shm  32K
+# commhub.db-wal  4.1M
+```
+
+`-shm` 和 `-wal` 是 SQLite WAL 模式的附属文件，正常情况下不需要手动处理。你可以直接用 SQLite 客户端查这个库，CH 2 会展开 schema 读法和诊断 SQL。
+
+这个路径是 anet "本地优先"承诺的物理证据——任务记录、Agent 状态、消息历史，没有一行数据离开你的机器。
+
+anet 全局配置落在另一个位置：
+
+```
+~/.anet/config.json
+```
+
+实测内容：
+
+```json
+{
+  "hub": "http://127.0.0.1:9200",
+  "token": "utok_...",
+  "user": {
+    "username": "admin",
+    "role": "admin"
+  },
+  "network_id": "net_...",
+  "network_name": "default"
+}
+```
+
+config 里的 token 是认证凭据，CH 4 讲多机安全时展开这套 token 模型。
+
+---
+
+## 5. 登录 Hub
+
+Hub 启动后，CLI 还需要登录才能与 Hub 交互。首次运行通常 `anet hub start` 会自动完成 bootstrap，但如果你在另一个终端操作，或者重启后 token 丢失，手动登录：
+
+```bash
+anet login
+# 或者明确传参：
+anet login --username admin --password anethub
+```
+
+登录成功后，token 写入 `~/.anet/config.json`，后续命令自动带上认证。
+
+**立刻改密。** 默认密码 `anethub` 是公开的——任何知道你 `:9200` 端口的人都能用它登录。即使现在只在本机跑，养成习惯：
+
+```bash
+anet passwd
+# 按提示输入当前密码（anethub）和新密码
+```
+
+默认 Hub 绑定 `127.0.0.1`，不对外暴露，风险有限。但 CH 4 一旦你用 `--host 0.0.0.0` 开放到局域网或公网，忘改密码的代价就不一样了。
+
+---
+
+## 6. anet doctor：读懂系统自检
+
+```bash
+anet doctor
+```
+
+实测输出（节选，本机当前状态）：
+
+```
+anet doctor — System Diagnostic
+
+  ✅ Global config (~/.anet/config.json) (http://127.0.0.1:9200)
+  ✅ Auth token configured
+  ✅ CommHub reachable (http://127.0.0.1:9200 v0.8.2)
+  ℹ  API version: v3
+  ℹ  Sessions: 84 registered
+  ℹ  SSE connections: 61 active
+  ℹ  License: trial
+  ✅ Multi-network
+  ✅ Nodes configured (6 node(s))
+  ℹ    my-agent: claude-code-cli ● running node_id=n_...
+  ✅ No plain-secret config (all env values are either non-secret or envRef objects)
+  ✅ Claude Code CLI
+  ✅ Codex CLI
+  ✅ Bun runtime
+  ❌ .mcp.json commhub channel — missing commhub server entry
+  ⚠  Telegram bot token: ... is empty; token lost.
+
+  Result: 9 ok, 1 warnings, 1 errors
+```
+
+（节点 alias 已替换为示意名，`node_id` 已脱敏。`v0.8.2` 是 CommHub Server 组件版本——该组件版本号以你本机实际输出为准。）
+
+`SSE` 全称 Server-Sent Events（服务端主动推送），是 anet Hub 向 Agent 实时推送任务和状态变更的底层协议。
+
+### 6.1 每一行的含义
+
+| 指示符 | 含义 |
+|---|---|
+| `✅` | 检查通过，可忽略 |
+| `ℹ` | 信息类输出，不是错误，只是告诉你当前状态 |
+| `⚠` | 警告，功能可用但有配置不完整，视情况处理 |
+| `❌` | 错误，当前状态下某个功能不可用，需要修复 |
+
+**新装完 Hub，正常状态下的 doctor 输出应该是**：
+
+- `✅ Global config` — CLI 找到了 `~/.anet/config.json` 且 Hub URL 可达
+- `✅ Auth token configured` — 登录成功，token 存在
+- `✅ CommHub reachable` — Hub 进程在跑，HTTP 可达
+- `✅ Bun runtime` — bunx 可用，按需拉取组件没问题
+
+节点相关的检查项在你还没创建任何节点时可能是 `ℹ  Nodes configured (0 node(s))`，属于正常。
+
+### 6.2 两类常见新装错误
+
+**Hub 未启动时 doctor 报什么：**
+
+```
+❌ CommHub reachable — Connection refused (http://127.0.0.1:9200)
+```
+
+原因：你忘了运行 `anet hub start`，或者 Hub 进程意外退出了。
+
+处理：检查是否有 Hub 进程在跑（`ps aux | grep commhub`），如果没有重新 `anet hub start`。
+
+**Node.js 版本不足时 doctor 报什么：**
+
+`anet doctor` 本身不检查 Node.js 版本，但 `anet hub start` 拉取 commhub-server 时如果 npx/bunx 环境有问题会报类似 `EBADENGINE` 的错。
+
+遇到拉取失败时先检查 `node --version`。
+
+---
+
+## 7. 验证 Hub 正常运行
+
+三步确认：
+
+```bash
+# 1. 查 Hub 进程端口
+# macOS / Linux：
+lsof -i :9200 | grep LISTEN
+# 应该看到 node 或 bun 在监听 :9200（取决于 commhub-server 启动方式）
+
+# 2. 查 Hub 配置
+anet hub config
+# 输出：{"port": "9200", "host": "127.0.0.1"}
+
+# 3. 用 doctor 确认可达
+anet doctor | grep "CommHub reachable"
+# 应该是：✅ CommHub reachable (http://127.0.0.1:9200 v0.8.2)
+```
+
+三步都通，Hub 就绪。下一节创建第一个 Agent 节点（`anet node create`），连上这个 Hub。
+
+---
+
+## 总结
+
+本节做了五件事：
+
+1. **确认 Node.js >= 22.13.0**，理解 `EBADENGINE` 的触发条件和后果
+2. **`npm install -g @sleep2agi/agent-network`** 装好 CLI，明白它不预装服务组件
+3. **`anet hub start`** 拉起 CommHub Server，组件首次按需自动拉取
+4. **`anet login` + 改密**，获取 token，消除默认弱密码风险
+5. **`anet doctor`** 读懂健康报告，区分 ✅ / ℹ / ⚠ / ❌ 的含义
+
+Hub 是 anet 的唯一中枢。所有 Agent 的注册、任务派发、状态推送都经过这一个本地进程，数据全落在 `~/.commhub/commhub.db`，不离开本机。
+
+下一节：`anet node create` 交互式建第一个 Agent 节点，选 Runtime、配 Provider、填 API Key，看到 `SSE（Server-Sent Events）connected` 确认上线。
+
+---
+
+## 附录：本节命令速查
+
+```bash
+# 安装
+npm install -g @sleep2agi/agent-network
+
+# 验证安装（两者输出相同）
+anet --version
+anet -v
+
+# Hub 生命周期
+anet hub start                   # 启动 CommHub Server（:9200）
+anet hub start --port 8080       # 自定义端口
+anet hub start --host 0.0.0.0    # 开放到 LAN（配合 CH4 安全节使用）
+anet hub config                  # 查当前 Hub 配置
+# Ctrl+C                         # 停止 Hub
+
+# 账号
+anet login                       # 交互式登录
+anet login --username admin --password anethub  # 明确传参
+anet passwd                      # 改密（首次登录后立即执行）
+anet whoami                      # 确认当前用户 + network
+
+# 诊断
+anet doctor                      # 系统健康检查（Hub 可达 / token 有效 / 节点状态）
+```
+
+> Node.js >= 22.13.0。低版本触发 `EBADENGINE`，部分交互功能异常。

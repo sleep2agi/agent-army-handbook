@@ -1,0 +1,233 @@
+---
+title: "打开 Web Dashboard — 第一次看见你的 Agent 团队"
+estimated_minutes: 13
+order: 4
+---
+
+# 打开 Web Dashboard — 第一次看见你的 Agent 团队
+
+> 跑了三节命令行，现在用一个浏览器标签把整个 Agent 团队的状态一次性看清楚。
+
+## 0. 一句话先讲明白
+
+**`anet hub dashboard` 启动本地 Web UI，是 CLI 的图形化补充，不是替代。**
+
+本节是 CH1 的收尾，给 Dashboard 一个初识。七个面板的深度用法留到 CH5；这里只到"打开、登录、Overview 初识、弄清楚 Dashboard 跟 CLI 是什么关系"这四件事。
+
+---
+
+## 你将学到
+
+- `anet hub dashboard` 的启动方式、端口与进程关系
+- Dashboard UI 布局：左侧导航 / 中间拓扑图 / 右侧详情栏
+- Overview 节点拓扑图怎么读（三分钟版）
+- Dashboard 是 CLI 的补充而非替代——什么情况下用哪个
+- Dashboard 数据刷新机制（SSE vs 轮询）
+
+## 适合谁
+
+完成 CH1 L01–L03（Hub 启动 + 第一个节点 + PR Review Demo 跑通）的读者。没跑过 Hub 的先回去把 `anet hub start` 跑起来，再来看这节。
+
+---
+
+## 1. 启动 Dashboard
+
+CommHub Server（`:9200`）已经在跑了。Dashboard 是一个独立进程，需要单独启动：
+
+```bash
+anet hub dashboard
+```
+
+实测输出（v2.2.x）：
+
+```
+[anet] Starting Dashboard on 127.0.0.1:3000...
+[anet] Connecting to CommHub: http://127.0.0.1:9200
+[anet] 🔒 Dashboard auth token loaded from admin-utok.json
+[anet] spawning dashboard @preview (anet 2.2.x)
+```
+
+几秒后用浏览器打开 `http://localhost:3000`。
+
+### 1.1 Dashboard 进程是独立的
+
+Dashboard 跟 CommHub Server 是两个进程：
+
+```
+Terminal A（或 tmux pane 1）：anet hub start        → :9200（CommHub Server）
+Terminal B（或 tmux pane 2）：anet hub dashboard     → :3000（Dashboard UI）
+```
+
+关掉 Dashboard 进程不影响 CommHub Server，Agent 之间的通信照常。关掉 CommHub Server 则 Dashboard 变成空壳——能打开页面，但拿不到任何数据。
+
+### 1.2 端口冲突怎么办
+
+如果 `:3000` 被其他服务占用（常见于本地 Next.js / Vite 开发环境），用 `--port` 换掉：
+
+```bash
+anet hub dashboard --port 3001
+```
+
+CommHub Server 同理（`anet hub start --port 8080`）。改了 Server 端口后，Dashboard 还需要知道去哪连 Server——查当前配置：
+
+```bash
+anet hub config
+```
+
+---
+
+## 2. 登录
+
+浏览器打开 `http://localhost:3000`，看到登录表单。
+
+默认凭据：
+
+| 字段 | 值 |
+|---|---|
+| 用户名 | `admin` |
+| 密码 | `anethub` |
+
+**改密见 L01 §5，确认此时已改。** 如果还没改，现在运行 `anet passwd` 改掉再继续——默认密码是公开的，CH4 把 Hub 开到公网之前必须改。
+
+---
+
+## 3. Dashboard UI 布局
+
+登录后先做个方向感。页面分三区：
+
+- **左侧导航栏**：Overview / Nodes / Tasks / Messages / Chat / Admin / Settings，竖向排列。当前所在面板高亮。
+- **中间主区**：Overview 面板是一张拓扑图，CommHub 居中，已连接的 Agent 节点从四周连入，连线颜色反映节点状态（绿=idle，黄=working，灰=offline）。
+- **右侧详情抽屉**：点击拓扑图上的某个节点，右侧展开该节点的基本信息（alias、runtime、所在 network、最近任务）。不点节点时详情抽屉收起。
+
+如果你的拓扑图是空的，说明没有节点连到 Hub——先回 L02 确认 `anet node start` 已经跑起来，Hub 日志里能看到 `[SSE] agent connected`。
+
+---
+
+## 4. Overview 节点拓扑初识
+
+### 4.1 三种节点状态
+
+- **idle（空闲）**：节点连着 Hub，SSE 推送正常，没有在跑任务
+- **working（工作中）**：节点正在处理一条任务
+- **offline（离线）**：节点断开或未启动，Hub 标记为离线
+
+### 4.2 用 `anet status` 做对照
+
+打开另一个终端跑：
+
+```bash
+anet status
+```
+
+CH1 新装环境（只有一个节点）的实测输出结构：
+
+```
+CommHub: http://127.0.0.1:9200
+Agents: 1 idle, 0 working, 0 offline
+SSE:    1 connected
+Tasks:  0 recent
+
+Recent Tasks:
+STATUS     FROM            TO              CONTENT
+──────── ─────────────── ─────────────── ──────────────────
+(empty)
+```
+
+`anet status` 是 Overview 数据的 CLI 投影——两者读同一个数据源（CommHub Server 内存 + SQLite）。如果 Overview 显示的 idle 数跟 CLI 不一致，Dashboard 可能在缓存，刷新页面即可。
+
+### 4.3 数据刷新机制
+
+Dashboard 与 CommHub Server 之间用 **SSE（Server-Sent Events）长连接**推送状态变更，不是轮询。节点上线/下线、任务状态变更会在约 1 秒内反映到拓扑图，无需手动刷新。只有首次加载或网络断线重连时会走一次全量 HTTP 拉取。
+
+### 4.4 Overview 的定位
+
+Overview 面板的作用在 CH1 只有一个：**让你确认节点确实连上来了**。
+
+你可以在 Overview 点击节点查看基本信息，这是读操作。**Dashboard 不能远程启动或停止别人机器上的 Agent**——`anet node start` / `anet node stop` 是在节点本地执行的 CLI 操作，Dashboard 经网络连 Hub，没有向节点机器发送进程级控制指令的通道。Nodes 面板（CH5 深入）提供节点列表和部分配置操作，但进程启停仍然需要在节点所在机器上用 CLI 完成。
+
+其余面板是 CH5 的内容，本节先按下不表——每个都值得期待：
+
+- **Nodes 面板**：所有节点的详细列表，network 归属、runtime 版本、在线时长一览无遗
+- **Tasks 面板**：任务链路时间线视图，能追一条任务从发起到完成的完整经过
+- **Messages 面板**：Agent 间的原始消息记录，调试消息格式时不用猜
+- **Chat 面板**：anet 区别于多数多 Agent 系统的独家功能——人在 Agent 协作进行中直接切进去说话、修正方向、给追加指令，CLI 做不到这件事
+- **Admin / Settings**：用户管理、Hub 参数、连接配置
+
+---
+
+## 5. Dashboard 与 CLI 的关系
+
+### 5.1 CLI 的不可替代场景
+
+**脚本和自动化**：`anet node start`、`anet project up` 这类命令天然适合写进 shell 脚本、CI、tmux 启动脚本。Dashboard 是浏览器 UI，不能被脚本调用。
+
+**快速诊断**：
+
+```bash
+anet doctor          # 系统自检，检查 Node.js 版本、Hub 连接、组件安装状态
+anet logs my-bot     # 直接拿 Agent 日志，不需要开浏览器
+anet whoami          # 确认当前登录用户和所在 network
+```
+
+这些命令在 SSH 到远端服务器时特别有用——远端环境没有浏览器。
+
+**节点生命周期管理**：`anet node create`、`anet node start`、`anet node stop`、`anet node delete`、`anet network create` 这类操作在节点本地 CLI 完成。Dashboard 侧重查看和监控，不提供远程进程控制。
+
+### 5.2 Dashboard 的优势场景
+
+**多节点状态总览**：当你有 10 个 Agent 节点同时跑的时候，拓扑图比逐个 `anet logs` 看快得多。
+
+**任务历史查阅**：Tasks 和 Messages 面板的时间线视图比 `anet tasks` CLI 输出更容易扫描（CH5 展开）。
+
+**人机协作介入**：Chat 面板是 Dashboard 独有的功能——在 Agent 协作进行中，人直接切进去说话、修正方向、给追加指令。这件事 CLI 做不到（CH5 展开）。
+
+### 5.3 一句话总结
+
+> **CLI 负责创建、启动、脚本化；Dashboard 负责观测、查阅、介入。**
+
+工程习惯建议：部署期用 CLI，运行期保持 Dashboard 开着当监控面板。
+
+---
+
+## 6. CH1 收尾 — 你现在有了什么
+
+跑完 CH1 四节，你手上有一套可以工作的最小 anet 环境：
+
+| 组件 | 状态 |
+|---|---|
+| CommHub Server（`:9200`）| 在跑，本地 SQLite 持久化 |
+| 至少一个 Agent 节点 | 创建、启动、SSE 上线 |
+| PR Review Demo | 跑通，见过多 Agent 并行协作 |
+| Web Dashboard（`:3000`）| 打开，改了默认密码，Overview 能看到节点 |
+
+这是 anet 的最小可用形态。从 CH2 开始往深走：
+
+- **CH2 CommHub 通信中枢**：17 个 MCP 工具是什么、Agent 之间怎么互相派活、任务链路怎么 debug
+- **CH3 Runtime 与 Provider**：三种 Runtime 各自的边界条件、8 家 Provider 怎么混搭省成本
+- **CH4 多机部署**：把 Hub 开到局域网 / 公网，安全 checklist，`anet project up` 一条命令管整个 Agent 军团
+- **CH5 Dashboard 实战**：七个面板逐一拆开，包括那个 CLI 做不到的 Chat 人机协作面板
+
+---
+
+## 总结
+
+本节做了四件事：
+
+1. **启动 Dashboard**：`anet hub dashboard` → `:3000`，独立进程，不影响 CommHub Server
+2. **登录**：默认凭据 `admin/anethub`，改密见 L01 §5，装完就改
+3. **Overview 初识**：节点拓扑图读 idle/working/offline，SSE 驱动实时刷新，与 `anet status` 数据来源相同
+4. **CLI vs Dashboard 分工**：节点启停是本地 CLI 操作，Dashboard 不能远程控制进程；CLI 做创建启动脚本化，Dashboard 做观测查阅介入
+
+CH5 会把 Dashboard 的 Nodes、Tasks、Messages、Chat、Admin、Settings 六个面板逐一拆透。现在只需要知道它能打开、能看到你的节点，就够了。
+
+---
+
+## 附录：本节命令速查
+
+| 命令 | 作用 |
+|---|---|
+| `anet hub dashboard` | 启动 Dashboard，默认 `:3000` |
+| `anet hub dashboard --port 3001` | 指定端口启动 |
+| `anet hub config` | 查看 Hub 当前配置（Server 地址 / 端口等） |
+| `anet status` | CLI 投影：节点数、SSE 连接数、最近任务 |
+| `anet passwd` | 修改 admin 密码（改密见 L01 §5） |

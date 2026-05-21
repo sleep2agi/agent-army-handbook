@@ -1,0 +1,450 @@
+---
+title: "跑通 PR Review Demo — 3 个 reviewer + 1 judge 两分钟全自动"
+estimated_minutes: 15
+order: 3
+---
+
+# 跑通 PR Review Demo — 3 个 reviewer + 1 judge 两分钟全自动
+
+> 一条命令，4 个 Agent 自动上线、并行审查、汇总结论、退出清场——你只需要看输出。
+
+## 0. 一句话先讲明白
+
+`anet demo pr-review` 启动一个独立的临时 network，在里面拉起 3 个 reviewer Agent（安全 / 性能 / 风格）和 1 个 judge Agent，三路并行审查你指定的代码变更，judge 汇总输出 Markdown 报告，完事自动清场。整个过程约两分钟，不需要你手动创建任何 Agent 节点。
+
+这节课的目标不是让你学会配 PR 审查流水线（那是 CH 6 的事）——而是让你**亲眼看到多 Agent 并行协作产出的全过程**，建立直觉。
+
+---
+
+## 你将学到
+
+- `anet demo pr-review` 的三个入口（`--ref` / `--diff` / `--pr`）各自适用场景
+- demo 内部的 4 角色协作流程：3 reviewer 并行 → judge 汇总
+- demo 独立 network 机制：怎么做到「跑完自动清场」
+- 怎么读输出报告，以及 `--keep` 保留现场做 debug 用
+- 前置条件核查：Hub、login、API key 三件事缺一不可
+
+## 适合谁
+
+已经跑完 L01（Hub 启动）和 L02（第一个节点上线）的读者。如果 Hub 还没起或者还没 `anet login`，先回去把前两节做完。
+
+---
+
+## 1. 前置条件核查
+
+`anet demo pr-review` 不是一个纯 CLI 工具——它会在 Hub 上动态创建 Agent 节点，所以有三个硬性前置：
+
+### 1.1 Hub 在线
+
+```bash
+anet doctor
+```
+
+看输出里 `CommHub reachable` 一行是否出现 `✅`（形如 `✅ CommHub reachable (http://127.0.0.1:9200 ...)`）。如果 Hub 没起，先：
+
+```bash
+anet hub start
+```
+
+Hub 默认跑在 `:9200`，命令会阻塞前台，建议新开一个终端窗口或用 `--tmux` 模式（见 L01）。
+
+### 1.2 已经 login
+
+```bash
+anet whoami
+```
+
+如果显示 `not logged in`，执行：
+
+```bash
+anet login --username admin --password anethub
+```
+
+> **提醒**：`admin/anethub` 是 Hub 的默认账号，仅用于本地开发。如果你在 L01 跟着做过公网部署或改密，用改后的凭证。
+
+### 1.3 MiniMax API key
+
+**PR Review Demo 默认用 MiniMax 作为 Agent LLM Provider。** 这是 demo 内置的选型，不是 bug：MiniMax 支持 tool_use，国内直连不需要代理，适合入门演示。
+
+demo 按以下顺序读 key：
+1. `--key <value>` 命令行参数
+2. 环境变量 `MINIMAX_KEY`
+3. 环境变量 `ANTHROPIC_AUTH_TOKEN`（如果你用的是兼容 Anthropic 接口的 MiniMax 接入方式）
+
+推荐用环境变量，避免 key 出现在 shell history：
+
+```bash
+export MINIMAX_KEY=${YOUR_MINIMAX_KEY}
+```
+
+如果你手头没有 MiniMax key，可以先看第 5 节的输出解读——demo 输出格式和多 Agent 协作逻辑跟 key 无关。申请地址见 [platform.minimaxi.com](https://platform.minimaxi.com)，anet 多模型配置说明在 [anet.sh/guide/multi-model](https://anet.sh/guide/multi-model)，PR Review Demo 的完整参数说明在 [anet.sh/cases/pr-review-room](https://anet.sh/cases/pr-review-room)。
+
+---
+
+## 2. 三个入口——选哪个
+
+`anet demo pr-review` 的第一个参数决定"审查什么代码"。三选一，不能混用：
+
+```
+--diff <file>     本地 .diff / .patch 文件
+--ref <ref>       git diff <ref>..HEAD，自动拿当前 branch 的变更
+--pr <url>        GitHub PR URL，用 gh CLI 拉 .diff
+```
+
+### 2.1 `--ref`：最常用，适合本地开发分支
+
+如果你正在一个 git 仓库里开发，想审查相对于 main 分支的改动：
+
+```bash
+cd /path/to/your-repo
+anet demo pr-review --ref origin/main
+```
+
+这一行等价于 `git diff origin/main..HEAD`，自动把 patch 传给 demo。**不需要事先 push 或开 PR。** 在本地 feature branch 上随时可以跑。
+
+`--ref` 接受任何 git 可以识别的 ref：
+
+```bash
+anet demo pr-review --ref HEAD~3          # 最近 3 个 commit
+anet demo pr-review --ref v2.1.0          # 相对某个 tag
+anet demo pr-review --ref upstream/main   # 相对 upstream remote
+```
+
+> **坑**：如果当前 branch 跟 `--ref` 之间没有任何差异（即 `git diff` 返回空），demo 会提前退出并报错。确认 `git diff origin/main --stat` 有输出再跑。
+
+### 2.2 `--diff`：适合有现成 patch 文件
+
+```bash
+anet demo pr-review --diff ./my-pr.diff
+```
+
+适合：收到别人发来的 `.diff` 文件；从 CI 系统下载的 patch；手动 `git diff > my-pr.diff` 保存的文件。
+
+文件格式必须是标准 unified diff（`git diff` 默认输出格式）。
+
+### 2.3 `--pr`：适合已经开了 GitHub PR
+
+```bash
+anet demo pr-review --pr https://github.com/owner/repo/pull/42
+```
+
+**前置：本地需要装 `gh` CLI。** demo 内部用 `gh pr diff <url>` 拉取 patch。如果没有 `gh`：
+
+```bash
+# macOS
+brew install gh
+gh auth login
+
+# Linux
+# 见 https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+```
+
+`--pr` 的好处：直接用 PR URL，不用手动 export diff。Private repo 需要 `gh` 已授权对应的 GitHub 账号权限。
+
+---
+
+## 3. 跑起来
+
+前置条件都满足，进入一个有代码改动的 git 仓库，执行：
+
+```bash
+anet demo pr-review --ref origin/main
+```
+
+你会看到 demo 依次做以下事情（终端输出，实际顺序和格式以你运行时为准）：
+
+```
+[pr-review] 读取 diff: git diff origin/main..HEAD
+[pr-review] Diff 行数: 312 行
+[pr-review] 创建独立 network: pr-review-a3f2
+[pr-review] 启动 security-reviewer-a3f2
+[pr-review] 启动 performance-reviewer-a3f2
+[pr-review] 启动 style-reviewer-a3f2
+[pr-review] 启动 judge-a3f2
+[pr-review] 向三个 reviewer 派发 review 任务 (并行)
+...
+[pr-review] security-reviewer-a3f2 完成
+[pr-review] performance-reviewer-a3f2 完成
+[pr-review] style-reviewer-a3f2 完成
+[pr-review] 向 judge 派发汇总任务
+...
+[pr-review] judge-a3f2 完成
+[pr-review] 报告写入: ./pr-review-a3f2-20260521-1423.md
+[pr-review] 清理: 停止并删除 4 agent + network pr-review-a3f2
+[pr-review] 完成，耗时 1m47s
+```
+
+> 以上是示意输出 —— demo 的实际终端内容取决于你的 Provider key、代码 diff 和 LLM 输出，跑一次就能看到真实进度。耗时、报告文件名格式随每次运行而变。
+
+整个过程不需要你的任何干预。Demo 的进度在终端滚动，报告落到当前目录的 `./pr-review-<id>-<ts>.md`。
+
+---
+
+## 4. 4 角色协作流程
+
+理解这个流程，是你以后自己设计多 Agent 系统的基础。
+
+### 4.1 角色分工
+
+demo 在独立 network 里创建 4 个 Agent，别名后缀带随机 4 hex（默认，可用 `--suffix` 自定义）：
+
+| 角色 | alias 示例 | 职责 |
+|---|---|---|
+| security-reviewer | `security-reviewer-a3f2` | 审查安全漏洞：注入、权限、加密、敏感信息泄露 |
+| performance-reviewer | `performance-reviewer-a3f2` | 审查性能问题：算法复杂度、内存、I/O、N+1 查询 |
+| style-reviewer | `style-reviewer-a3f2` | 审查代码风格：可读性、命名、注释、一致性 |
+| judge | `judge-a3f2` | 汇总三份报告，输出最终评审结论 |
+
+### 4.2 消息流
+
+1. demo 脚本读取 diff，向三个 reviewer 各发一条 `send_task`（并行，三条同时发出，互不等待）
+2. 每条 `send_task` 经 CommHub MCP 写入 SQLite，Hub 通过 SSE 推给对应的 reviewer Agent
+3. 三个 reviewer 各自审查，完成后分别调 `report_status` 更新任务状态
+4. demo 脚本等到三个 reviewer 全部完成，再向 judge 发一条 `send_task`（含三份 reviewer 输出）
+5. judge 汇总三份输入，输出 Markdown 报告，demo 脚本写文件、清场
+
+**并行是这里的关键**。三个 reviewer 同时收到任务，同时开始审查，互相不等——~2 分钟的总耗时取决于最慢的那个 reviewer，而不是三段串行相加。judge 是唯一串行等待的步骤，它需要三份输出作为输入。
+
+这个模式叫 scatter-gather（分发-汇总模式），在多 Agent 设计里极为常见，后面 CH 6 会拆到源码级别。
+
+### 4.3 CommHub 在里面干什么
+
+用人话说：CommHub 是信箱。demo 脚本往信箱放三封信，三个 reviewer 各自取信、干活、回信，judge 等三封回信都到了再开始干。你在终端看到的进度滚动，就是这一系列 MCP 工具调用的实时反馈。
+
+技术细节：三个 `send_task` 调用通过 MCP Streamable HTTP 发到 CommHub Server（`:9200/mcp`），CommHub 把任务写进 SQLite，再通过 SSE（`:9200/events/<alias>`）推给对应的 reviewer Agent。每个 reviewer 跑完后调 `report_status` 更新任务状态，demo 脚本订阅这个状态变化，等到三个都完成再继续。
+
+---
+
+## 5. 读输出报告
+
+报告是 Markdown，默认写到当前目录：
+
+```
+./pr-review-<suffix>-<yyyymmdd>-<hhmm>.md
+```
+
+典型结构（以 judge 角色输出的汇总为准）：
+
+```markdown
+# PR Review Report
+
+**Diff**: git diff origin/main..HEAD  
+**Lines**: 312 (+241 / -71)  
+**Network**: pr-review-a3f2  
+**Generated**: 2026-05-21 14:23
+
+---
+
+## Security Review (security-reviewer-a3f2)
+
+### 发现问题
+...（审查内容）
+
+---
+
+## Performance Review (performance-reviewer-a3f2)
+
+...
+
+---
+
+## Style Review (style-reviewer-a3f2)
+
+...
+
+---
+
+## Judge Summary
+
+### 综合评分
+...
+
+### 必须修复
+...
+
+### 建议改进
+...
+
+### 总体结论
+...
+```
+
+> 以上是报告结构示意 —— 实际报告的具体内容取决于你的代码 diff 和各 reviewer Agent 的 LLM 输出，但章节骨架（4 个 reviewer 段 + 总体结论）是固定的。
+
+读报告的姿势：
+
+1. **先看 Judge Summary 里的"必须修复"**——这是三个 reviewer 共同认为严重的问题，judge 会综合权重打分。
+2. **每个 reviewer 的独立章节保留原始输出**，不经过 judge 过滤，里面有时候有 judge 没捕捉到的细节。
+3. **Diff 行数在报告头部**——如果你的 diff 超过 500 行，reviewer 的上下文窗口可能截断，结论参考价值会下降。大 PR 建议拆分后多次跑。
+
+---
+
+## 6. 常用参数
+
+### 6.1 `--out`：指定报告路径
+
+```bash
+anet demo pr-review --ref origin/main --out /tmp/review-$(date +%Y%m%d).md
+```
+
+适合把报告输出到固定位置，方便 CI 系统收集。
+
+### 6.2 `--keep`：保留现场
+
+```bash
+anet demo pr-review --ref origin/main --keep
+```
+
+跑完不删 4 个 Agent 和 network。用途：
+
+- 复盘每个 reviewer 的完整对话历史（在 Dashboard > Chat 里找对应 alias）
+- 查 `~/.commhub/commhub.db` 里这次 demo 的任务链路
+- 验证 CommHub 的 SSE 推送行为
+
+用完记得手动清：
+
+```bash
+anet node stop security-reviewer-a3f2
+anet node stop performance-reviewer-a3f2
+anet node stop style-reviewer-a3f2
+anet node stop judge-a3f2
+# 或者直接 anet project down（如果 cwd 是 demo 的工作目录）
+```
+
+### 6.3 `--step-timeout`：调超时
+
+默认每个 reviewer / judge 超时 180 秒。如果你的 diff 很大，或者 MiniMax 响应慢，可以调高：
+
+```bash
+anet demo pr-review --ref origin/main --step-timeout 360
+```
+
+如果某个步骤超时，demo 会在报告里标注"超时，无输出"并继续后续步骤（judge 能拿到的就是部分输出）。
+
+### 6.4 `--suffix`：固定 alias 后缀
+
+```bash
+anet demo pr-review --ref origin/main --suffix demo01
+```
+
+节点 alias 变成 `security-reviewer-demo01` 等固定名字，便于在 Dashboard 里反复找到同一批节点。调试时有用。
+
+---
+
+## 7. Demo 的独立 network 机制
+
+这个设计值得单独说一下，因为它体现了 anet 的一个核心概念。
+
+每次跑 `anet demo pr-review`，demo 脚本会创建一个随机命名的独立 network（比如 `pr-review-a3f2`），4 个 Agent 都在这个 network 里。跑完，demo 删掉这 4 个节点和这个 network。
+
+**为什么这样设计，而不是在 default network 里跑？**
+
+- **隔离**：demo 的节点和你自己的 Agent（如果有的话）不在同一 network，互相看不到，不会误收任务。
+- **幂等**：每次跑 demo 都是全新状态，不受上次 demo 的残留任务影响。
+- **可审计**：network ID 里有随机后缀，报告和 SQLite 记录可以精确追溯到哪次 demo run。
+
+这个"临时 network"模式是多 Agent 项目里常见的任务隔离手段，你以后自己写 Agent 脚本时可以照搬。
+
+如果你不想用独立 network，可以：
+
+```bash
+anet demo pr-review --ref origin/main --no-network    # 跑在 default network
+anet demo pr-review --ref origin/main --network abc1  # 指定已有 network
+```
+
+两个选项都不建议在生产里用——会让 demo 的节点和你的常驻 Agent 混在一起，出问题难排查。
+
+---
+
+## 8. 常见报错
+
+### 8.1 `diff is empty`
+
+```
+Error: diff is empty — nothing to review
+```
+
+原因：`git diff origin/main..HEAD` 没有输出，当前 branch 和 origin/main 一致。
+解法：确认 `git status` 有改动，或 `git log origin/main..HEAD --oneline` 有 commit。
+
+### 8.2 `hub not reachable`
+
+```
+Error: hub not reachable at localhost:9200
+```
+
+原因：CommHub Server 没有启动，或者跑在非默认端口。
+解法：`anet hub start`，另开终端再执行 demo。
+
+### 8.3 `not logged in`
+
+```
+Error: not logged in — run `anet login` first
+```
+
+原因：没有执行 `anet login`，或者 token 过期。
+解法：`anet login --username admin --password anethub`（默认账号）。
+
+### 8.4 MiniMax key 缺失或无效
+
+```
+Error: MiniMax API key missing or invalid
+```
+
+原因：`--key` 没传，`MINIMAX_KEY` 和 `ANTHROPIC_AUTH_TOKEN` 环境变量都没设，或者 key 本身失效。
+解法：`export MINIMAX_KEY=${YOUR_MINIMAX_KEY}` 后重跑。
+
+### 8.5 `--pr` 时 `gh` 报错
+
+```
+Error: gh CLI not found / not authenticated
+```
+
+原因：`gh` 未安装或未 `gh auth login`。
+解法：换用 `--ref` 或 `--diff`，或者先配好 `gh`。
+
+### 8.6 reviewer 超时，报告部分缺失
+
+judge 收到的 reviewer 输出有空缺，报告里对应章节显示超时标注。
+解法：加 `--step-timeout 360` 重跑，或者拆 diff（大 diff 是主要原因）。
+
+---
+
+## 总结
+
+跑通 PR Review Demo 需要三件事：Hub 在线、已登录、有 MiniMax key。三个入口（`--ref` / `--diff` / `--pr`）里 `--ref` 最常用，适合本地分支随时跑。
+
+Demo 内部的 scatter-gather（分发-汇总模式）（3 reviewer 并行 → 1 judge 汇总）是多 Agent 设计里的经典结构。Demo 在独立 network 跑完自动清场，不污染你的其他 Agent 环境。
+
+下一节（L04）打开 Dashboard，第一次用浏览器看到 Agent 团队的全貌——在那里你能认出刚才 demo 里的每个角色节点。
+
+---
+
+## 附录：本节命令速查
+
+```bash
+# 最常用：审查当前 branch 相对 main 的改动
+anet demo pr-review --ref origin/main
+
+# 本地 diff 文件
+anet demo pr-review --diff ./my-pr.diff
+
+# GitHub PR URL（需要 gh CLI）
+anet demo pr-review --pr https://github.com/owner/repo/pull/42
+
+# 保留现场 debug
+anet demo pr-review --ref origin/main --keep
+
+# 自定义输出路径 + 超时
+anet demo pr-review --ref origin/main \
+  --out /tmp/review.md \
+  --step-timeout 360
+
+# 固定 alias 后缀（便于 Dashboard 查找）
+anet demo pr-review --ref origin/main --suffix demo01
+
+# 完整选项
+anet demo pr-review --help
+```
+
+> 版本口径：以上命令在 anet v0.10.8（CLI 包 v2.2.x）实测，命令语法以 `anet demo pr-review --help` 输出为准。

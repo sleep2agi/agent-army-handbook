@@ -1,0 +1,448 @@
+---
+title: "创建并启动你的第一个 Agent 节点"
+estimated_minutes: 16
+order: 2
+---
+
+# 创建并启动你的第一个 Agent 节点
+
+> Hub 跑起来了。现在让一个 Agent 上线——创建、配置、启动，看到「SSE connected」的那一刻，你的第一个 Agent 成员就在线了。
+
+## 0. 一句话先讲明白
+
+`anet node create <name>` 交互式问你三个问题（runtime、provider、API key），写完配置；`anet node start <name>` 让节点连上 Hub，出现「SSE connected」代表上线成功。整个流程 30 秒，但有一个安全细节不能跳过：节点默认 `dangerouslySkipPermissions: true`，必须在一次性工作目录里跑，不能在 `$HOME`。
+
+---
+
+## 你将学到
+
+- `anet node create` 交互流程：runtime / provider / API key 三步选什么、为什么
+- `anet node start` 前台运行 vs `--tmux` 后台模式，分别适合哪种场景
+- 「SSE connected」出现代表什么，以及为什么不出现
+- 安全红线：`dangerouslySkipPermissions` 默认行为 + 工作目录隔离的正确做法
+- `anet node ls` / `anet info` / `anet logs` 三条日常运维命令
+
+## 适合谁
+
+已跑通上一节（Hub 在 `:9200` 运行，`anet login` 成功），准备把第一个 Agent 连上去的读者。
+
+---
+
+## 1. 先建一个隔离工作目录
+
+这一步必须在 `anet node create` 之前做。不是形式，是安全要求，下面会解释原因。
+
+```bash
+# 在你的项目目录或任意临时位置建一个干净目录
+mkdir ~/anet-workspace/my-first-agent
+cd ~/anet-workspace/my-first-agent
+```
+
+不要在 `$HOME` 直接操作，也不要在有敏感文件的项目根目录。原因见第 4 节。
+
+---
+
+## 2. `anet node create` — 三步交互
+
+在刚才建的目录里运行：
+
+```bash
+anet node create my-agent
+```
+
+CLI 会依次问你三个问题。
+
+### 2.1 选 Runtime
+
+```
+? Select runtime:
+  claude-code-cli
+  claude-agent-sdk
+  codex-sdk
+```
+
+**怎么选**：
+
+| 场景 | 推荐 runtime |
+|---|---|
+| 已有 Claude Pro 订阅，想边际成本接近零 | `claude-code-cli` |
+| 用国产模型 / 按 token 精确控成本 | `claude-agent-sdk` |
+| 团队用 OpenAI 账号 | `codex-sdk` |
+
+新手选 `claude-agent-sdk`：它内置 7 个 vendor preset，其中**书生 Intern、MiniMax 两家经 Docker E2E 全链路验证**（节点真启动 → 真 LLM 调用 → MCP 任务往返），是三者中最稳定的（详见 CH3）。**本节跟着选 `claude-agent-sdk`。**
+
+### 2.2 选 Provider
+
+选完 runtime 后，CLI 弹出 vendor 选单。这个选单**不按 runtime 过滤**，固定列出全部 7 个 vendor preset：
+
+```
+? Select provider:
+  intern       上海 AI Lab 书生（Intern）
+  minimax      MiniMax（国内直连，低成本）
+  mimo         小米 MiMo
+  anthropic    Anthropic Claude（官方 API）
+  codex        Codex / GPT（海外，需 codex auth login）
+  claude-code  Claude Code CLI（需 Claude Pro/Team/Max 订阅）
+  custom       自定义：任何 Anthropic 兼容 API
+```
+
+7 个 vendor preset：
+
+| 选项 | 对应服务 | 备注 |
+|---|---|---|
+| `intern` | 书生 Intern（上海 AI Lab） | 经 Docker E2E 全链路验证 |
+| `minimax` | MiniMax API | 国内直连、低成本；经 Docker E2E 全链路验证 |
+| `mimo` | 小米 MiMo | 内置 preset |
+| `anthropic` | Anthropic Claude 官方 API | 有官方 key 首选 |
+| `codex` | Codex / GPT | 海外，需 `codex auth login` |
+| `claude-code` | Claude Code CLI | 需 Claude Pro / Team / Max 订阅 |
+| `custom` | 自定义 endpoint | 任何 Anthropic 兼容 API |
+
+> **「验证」≠「支持」**：7 个都是 wizard 内置可选的 vendor preset（支持）；其中**书生 Intern、MiniMax 两家**经过 Docker E2E 全链路实测验证（节点真启动 → 真 LLM 调用 → MCP 任务往返）。其余 5 个 preset 可选但未做全链路 E2E 验证。
+
+**机制提示**：vendor 选单不按 runtime 过滤是刻意设计 —— 如果你在这里选了 `codex` 或 `claude-code`，anet 会用该 vendor 自带的 runtime 把你前一步选的 runtime **覆盖回** `codex-sdk` / `claude-code-cli`。即 vendor 选择可以反向决定 runtime。
+
+**DeepSeek、GLM、Kimi、OpenRouter 不是独立选单项**，它们走 `custom`：选 `custom` 后，CLI 会继续问你 `base_url`（如 `https://api.deepseek.com/v1`）和 `model`（如 `deepseek-chat`），填完即可 —— anet 通过 Anthropic 兼容端点接入它们。
+
+国产模型零成本尝试的最快路径：选 `custom`，填 DeepSeek 的 endpoint + model（DeepSeek 新注册有免费额度）。
+
+### 2.3 填 API Key
+
+```
+? ANTHROPIC_API_KEY: ****
+```
+
+key 不会写进配置文件的明文字段——anet 把它存为 `envRef` 对象。`envRef` 是一个引用结构，格式形如：
+
+```json
+{
+  "type": "envRef",
+  "name": "ANTHROPIC_API_KEY"
+}
+```
+
+运行时节点从**当前进程的环境变量**里读取对应的 key 值（即 shell 里 `export ANTHROPIC_API_KEY=sk-...` 设置的值，或通过 `.env` 文件由 anet 注入）。key 永远不落盘为明文，`anet doctor` 会检测 config 里是否混入了 plain-secret（明文写死），有则警告。
+
+> 如果你用 `custom` provider，CLI 会分别询问 `base_url` 和 API key，同样以 `envRef` 方式存储，例如 `DEEPSEEK_API_KEY`。
+
+> **实测注意**：交互界面的确切字段名和顺序因 runtime 和 provider 组合略有差异，以你实际看到的为准。以上示例基于 anet v0.10.8 + `claude-agent-sdk` + `anthropic`。
+
+### 2.4 创建完成后
+
+配置写入 `.anet/nodes/my-agent/config.json`（在当前工作目录下，不是全局 `~/.anet`）。
+
+```bash
+# 验证创建成功
+anet node ls
+```
+
+实测输出格式如下：
+
+```
+Nodes:
+
+  NAME          RUNTIME           STATUS    SSE  SESSION
+  ──────────── ──────────────── ──────── ──── ────────
+  my-agent      claude-agent-sdk  idle      ○    -
+```
+
+`STATUS=idle`、`SSE=○`（空心圆 = 未连接）是正常的——节点还没启动。
+
+---
+
+## 3. `anet node start` — 让节点上线
+
+### 3.1 前台运行（开发 / 调试首选）
+
+```bash
+anet node start my-agent
+```
+
+终端会锁住，输出节点日志。关键是看到：
+
+```
+SSE connected
+```
+
+出现这一行，节点已经连上 Hub 的 SSE 通道（`/events/my-agent`），Hub 可以主动向它推任务了。你的第一个 Agent 正式在线。
+
+**停止前台节点**：直接按 `Ctrl+C`，节点进程退出，SSE 断开，`anet node ls` 里 `SSE` 列变回 `○`。
+
+另开一个终端，确认：
+
+```bash
+anet node ls
+```
+
+```
+  NAME          RUNTIME           STATUS    SSE  SESSION
+  ──────────── ──────────────── ──────── ──── ────────
+  my-agent      claude-agent-sdk  idle      ●    a1b2c3d4
+```
+
+`SSE=●`（实心圆 = 已连接），节点上线确认。
+
+### 3.2 `--tmux` 后台运行（长期运行场景）
+
+```bash
+anet node start my-agent --tmux
+```
+
+anet 会新建一个 tmux session，在里面启动节点，然后 attach 到这个 session。你可以按 `Ctrl+B D` detach，节点继续跑。
+
+> **前提**：机器上需要装有 `tmux`。没装的话 `brew install tmux`（macOS）/ `apt install tmux`（Debian/Ubuntu）。
+
+什么时候用 `--tmux`：
+- 节点需要长期在线、接收 Hub 派活
+- SSH 远程机器上，不想让节点绑在 terminal session 上
+- 多节点同时启动（配合 `anet project up`，见 CH4）
+
+什么时候用前台运行：
+- 调试新节点，想实时看日志
+- 快速验证配置是否正确
+- 写教程截图
+
+### 3.3 「SSE connected」没出现怎么办
+
+常见原因和排查路径：
+
+**Hub 没在跑**：最常见。先检查：
+
+```bash
+anet doctor
+```
+
+看 `CommHub reachable` 是 `✅` 还是 `❌`。如果 Hub 没起，先 `anet hub start`。
+
+**API key 无效**：节点启动会尝试初始化 LLM 连接，key 无效时通常在日志里看到 401 或 authentication error。
+
+```bash
+anet logs my-agent
+```
+
+**网络问题（多机场景）**：如果 Hub 不在 localhost，确认 `anet init` 设置的 Hub URL 能 curl 到：
+
+```bash
+curl http://<hub-host>:9200/health
+```
+
+---
+
+## 4. 安全红线：`dangerouslySkipPermissions` 必须理解
+
+这是本节最重要的工程判断，不能跳过。
+
+### 4.1 默认行为
+
+打开任意节点的配置文件：
+
+```json
+{
+  "flags": {
+    "dangerouslySkipPermissions": true
+  }
+}
+```
+
+`dangerouslySkipPermissions: true` = **节点调用任何工具时不会弹确认框**，包括文件写入、Shell 命令执行、网络请求。
+
+这是 anet 的刻意设计：多 Agent 协作场景下，多个 Agent 同时跑，如果每次工具调用都要人工确认，系统就没法自动化。牺牲的是"人在回路"的那道安全闸。
+
+### 4.2 风险在哪
+
+Agent 在工作目录下有完整的读写权限。如果你在 `$HOME` 启动节点：
+
+- Agent 可以读到 `.ssh/`、`.env`、`.npmrc` 里的密钥
+- Agent 执行 Shell 命令时，误操作范围是整个 home 目录
+- 一个写错提示词的 Agent 可以删文件，且不会弹确认
+
+这不是假设风险——这是 `dangerouslySkipPermissions` 的字面含义。
+
+### 4.3 正确的隔离做法
+
+**一次性工作目录**：每个 Agent 项目建一个独立目录，节点从这个目录启动。
+
+```bash
+# 正确：隔离目录
+mkdir ~/anet-projects/pr-reviewer
+cd ~/anet-projects/pr-reviewer
+anet node create reviewer-1
+anet node start reviewer-1
+
+# 错误：在 home 跑
+cd ~
+anet node create reviewer-1   # 不要这样
+```
+
+**只放必要文件**：工作目录里只放这个 Agent 项目需要的文件，不放私钥、不放全局配置。
+
+**长期项目用 `anet project`**：把多个节点的工作目录统一管理，配合 `.anet/` 目录隔离（CH4 展开）。
+
+**多机 / 公网场景风险放大**：如果你把 Hub 暴露到公网（CH4），`dangerouslySkipPermissions` 的影响范围会随着节点机器的权限一起扩大。生产部署前务必读 CH4 安全配置。
+
+---
+
+## 5. 日常运维三条命令
+
+节点上线后，日常用这三条命令观测状态：
+
+### 5.1 `anet node ls` — 全局一眼
+
+```bash
+anet node ls
+```
+
+看三列：`STATUS`（节点的任务状态：`idle` = 空闲 / `working` = 在跑任务 / `offline` = 下线）、`SSE`（连接状态：`●` = 在线 / `○` = 离线）、`SESSION`（绑定的 Claude/Codex session ID）。
+
+常见问题：`SSE=●` 但 `STATUS=offline`——节点进程还活着、SSE 通道没断，但 Hub 侧状态记录滞后。稍等片刻或 `anet info <name>` 确认。
+
+### 5.2 `anet info <name>` — 单节点详情
+
+```bash
+anet info my-agent
+```
+
+实测输出结构如下（全新节点 vs 已执行过任务的节点，`Recent Tasks:` 区块行为不同）：
+
+```
+  Node: my-agent
+  ──────────────────────────────────
+  node_id:  n_xxxxxxxx
+  runtime:  claude-agent-sdk
+  model:    (default)
+  hub:      http://127.0.0.1:9200
+  channels: server:commhub
+  tools:    all (Claude Code preset)
+  flags:    dangerouslySkipPermissions=true
+  config:   .anet/nodes/my-agent/config.json
+  pid:      xxxxxxx ● running
+
+  Server Status:
+    status:   idle
+    task:     (none)
+    updated:  2026-05-21 10:00:00
+
+  Recent Tasks:
+    (none)
+```
+
+> `task: (none)` 和 `Recent Tasks: (none)` 只在全新节点出现。节点执行过任务后，`Recent Tasks:` 会列出最近的 task ID 和状态摘要；`task:` 字段在任务进行中时显示当前 task ID。
+
+`flags: dangerouslySkipPermissions=true` 会明确显示——这是提醒，不是 bug。
+
+### 5.3 `anet logs <name>` — 查近期日志
+
+```bash
+anet logs my-agent
+```
+
+输出节点最近的日志条目。节点刚创建、尚未执行任何任务时会显示 `No logs yet.`，正常。
+
+日志主要看：
+- SSE 连接 / 断开事件
+- 工具调用记录（Agent 做了什么）
+- 错误堆栈（API key 无效、网络超时等）
+
+---
+
+## 6. 节点生命周期速查
+
+创建一个节点到彻底清理的完整流程：
+
+```bash
+# 创建
+anet node create my-agent
+
+# 启动（前台，Ctrl+C 停止）
+anet node start my-agent
+
+# 启动（后台 tmux）
+anet node start my-agent --tmux
+
+# 停止
+anet node stop my-agent
+
+# 恢复指定 session（需要 --session 参数）
+anet node resume my-agent --session <session-id>
+
+# 查详情
+anet info my-agent
+
+# 查日志
+anet logs my-agent
+
+# 列出所有节点
+anet node ls
+
+# 彻底删除（配置 + session 绑定）
+anet node delete my-agent
+```
+
+> **`node stop` vs `node delete`**：`stop` 只停进程，配置和 session 绑定保留，下次 `start` 可以继续；`delete` 连配置一起删，session ID 失效，相当于彻底清场。
+
+> **关于 `anet node resume`**：裸用 `anet node resume <name>`（不带 `--session`）已废弃，运行会报错退出。恢复指定 session 请用 `anet node resume <name> --session <id>`；日常重启节点直接用 `anet node start <name>`，它默认延续上次 session。
+
+---
+
+## 7. 验证节点上线
+
+节点上线后，最快的当下可执行验证是确认 SSE 连通和 Hub 侧状态：
+
+```bash
+# 另开一个终端（节点在前台跑时）
+anet node ls
+```
+
+看到 `SSE=●`、`STATUS=idle`，节点已在线且空闲，准备接任务。
+
+也可以直接戳 Hub 的健康检查端点，确认 Hub 服务在正常响应：
+
+```bash
+curl -s http://127.0.0.1:9200/health
+```
+
+Hub 返回 `{"ok":true,...}` 说明 Hub 服务正常。
+
+> 注：不要用 `/mcp` 端点做验证 —— `/mcp` 需要鉴权，匿名 `curl` 只会返回 `{"error":"unauthorized"}`，会误导你以为 Hub 出问题了。
+
+> **完整 ping 任务留到 CH2**：向节点真正派发一条任务、看它用工具回复，需要 MCP `send_task` 工具——那是 CH2 的主题。现在节点在线就够了，不要跳步。
+
+---
+
+## 总结
+
+本节完成了：
+
+1. 在隔离工作目录创建第一个节点——runtime 选 `claude-agent-sdk`，provider 从 7 个 vendor preset 里选（Intern / MiniMax / MiMo / Anthropic / Codex / Claude Code / custom），key 以 `envRef` 安全存储（运行时从环境变量读取，不落盘为明文）
+2. 用 `anet node start` 前台启动，看到 `SSE connected` 确认上线；`Ctrl+C` 停止；`--tmux` 用于长期后台运行
+3. 理解了 `dangerouslySkipPermissions: true` 的含义和工作目录隔离的必要性
+4. 掌握三条运维命令：`anet node ls`（全局概览）/ `anet info`（单节点详情，含 Recent Tasks）/ `anet logs`（日志）
+
+节点在线了。下一节跑 PR Review Demo——三个 reviewer Agent 并行出报告，两分钟全自动，你会第一次看到多 Agent 协作实际产出。
+
+---
+
+## 附录：本节命令速查
+
+```bash
+# 节点创建 + 启动
+anet node create <name>          # 交互式创建（选 runtime / provider / key）
+anet node start <name>           # 前台启动，终端锁定，实时看日志；Ctrl+C 停止
+anet node start <name> --tmux    # 后台启动（需要 tmux），Ctrl+B D 可 detach
+
+# 运维观测
+anet node ls                     # 列出所有节点 + 状态概览（idle/working/offline）
+anet info <name>                 # 单节点详情（flags / pid / Recent Tasks）
+anet logs <name>                 # 最近日志
+
+# 节点生命周期
+anet node stop <name>                          # 停止进程（保留配置）
+anet node resume <name> --session <id>         # 恢复指定 session（需带 --session）
+anet node delete <name>                        # 彻底删除节点 + 配置
+
+# 诊断
+anet doctor                      # 系统诊断（Hub 连通 / key 安全 / 组件状态）
+curl -s http://127.0.0.1:9200/health           # 确认 Hub 服务正常（/mcp 需鉴权，勿用）
+```
+
+> 版本说明：本节基于 anet v0.10.8（产品发布版）实测。CLI 包 `@sleep2agi/agent-network` 独立迭代，`anet -v` 显示的包版本号（当前 `v2.2.x`）以你实际装到的为准。
