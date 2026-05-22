@@ -1,0 +1,313 @@
+---
+title: "多机安全红线 + 多用户权限 — token 模型与 network 角色"
+order: 3
+estimated_minutes: 17
+---
+
+# 多机安全红线 + 多用户权限 — token 模型与 network 角色
+
+> Hub 一旦从本机走向局域网或公网，就不再只是“开发工具进程”。它变成了能驱动多个 Agent 读文件、写文件、跑命令、互相派活的控制面。
+
+## 0. 一句话先讲明白
+
+多机部署的第一原则不是先追求“所有人都能连上”，而是先收口风险：Hub 不裸露公网，默认密码必须改，`utok_` 和 `ntok_` 不能混用，network 角色只做入门级权限分层，真正的生产安全还要靠 TLS、最小账号、token 最小分发、工作目录隔离和 Git 泄漏检查一起完成。
+
+本节只讲 v1 课程需要掌握的安全红线。anet 的 network / invite / cross-user sharing 命令已经存在，但 README 把这条路径标为“代码已在，尚未作为主 verified flow 做完整 E2E”。所以这里不会把 RBAC 写成你唯一的生产安全边界。
+
+## 你将学到
+
+- 为什么裸暴露 `:9200` 是多机部署的第一条红线
+- 为什么 `dangerouslySkipPermissions` 在多机环境会放大风险
+- `utok_` 和 `ntok_` 的区别，以及为什么节点不能拿用户 token 上线
+- network 角色 `owner` / `admin` / `member` / `viewer` 的入门读法和验证边界
+- `.anet/`、`.env`、日志和 token 如何避免进入 Git
+- 泄漏 token 后应该怎么处理，哪些事不能指望 `anet doctor --fix` 自动完成
+
+## 适合谁
+
+已经跑通 CH1 的本机 Hub 和节点，正在把 Hub 开到局域网、公网入口或多人协作环境的读者。你不需要是安全工程师，但需要能看懂命令行、配置文件和 token 的基本关系。
+
+## 1. 多机以后，Hub 就是控制面
+
+本机 quickstart 的默认命令是：
+
+```bash
+anet hub start
+```
+
+默认绑定 `127.0.0.1`，只有本机能访问。要让局域网机器加入，同一章 L01 用的是：
+
+```bash
+anet hub start --host 0.0.0.0
+```
+
+这一步会把 Hub 从“只给本机用”变成“其他网卡也能连入”。`9200` 后面不是静态网页，而是 CommHub 控制面：登录、network、节点 token、任务投递、SSE 连接都围绕它转。谁能连到 Hub，谁就能尝试登录或攻击它。
+
+所以边界很清楚：
+
+| 场景 | Hub 入口 |
+|---|---|
+| 本机实验 | 保持默认 `127.0.0.1:9200` |
+| 受控局域网 | 可临时 `--host 0.0.0.0`，只放行可信网段 |
+| 公网 / 跨城市 | Hub 仍监听本机，公网只给 HTTPS 反代入口 |
+
+不要把 `--host 0.0.0.0` 理解成生产安全配置。它只是“允许其他机器连接”的开关。
+
+## 2. 默认账号只是启动体验
+
+`anet hub start` 会 bootstrap 默认管理员体验。README verified flow 里第一步登录是：
+
+```bash
+anet login --username admin --password anethub
+```
+
+这组默认凭据只适合第一次启动。Hub 离开本机之后，先登录，然后立刻改密：
+
+```bash
+anet login --username admin --password anethub
+anet passwd
+anet whoami
+```
+
+`anet passwd` 会调用 Hub 的认证接口修改当前用户密码，不是改本地 JSON 文件。改完以后，不要再把 `admin/anethub` 写进脚本、截图或团队文档。
+
+如果只是临时教学演示，演示结束也要清理登录态：
+
+```bash
+anet logout
+```
+
+## 3. `utok_` 和 `ntok_` 不要混用
+
+anet 当前有两类你会直接看到的 token：
+
+| 前缀 | 用途 | 常见位置 |
+|---|---|---|
+| `utok_` | 用户登录 token，用来调用用户级 API、选择 network、创建节点 token | `~/.anet/config.json` |
+| `ntok_` | 节点 token，让某一个 Agent 节点接入 Hub / SSE | `{cwd}/.anet/nodes/writer-a/config.json` |
+
+创建节点时，CLI 会向 Hub 请求 `ntok_` 并写入节点配置。源码里明确禁止节点用 `utok_` 假装 `ntok_` 上线；如果节点配置里是用户 token，启动时会提示运行诊断修复。
+
+典型节点配置里会看到类似字段：
+
+```json
+{
+  "alias": "writer-a",
+  "hub": "$HUB_URL",
+  "token": "ntok_...",
+  "channels": ["server:commhub"],
+  "flags": {
+    "dangerouslySkipPermissions": true
+  }
+}
+```
+
+读这个文件时只记两点：它在项目目录下，不能提交；`token` 应该是 `ntok_...`，不是 `utok_...`。
+
+## 4. `dangerouslySkipPermissions` 不是 RBAC
+
+README 的典型节点配置里，`flags.dangerouslySkipPermissions` 是 `true`。这意味着节点会更自动地读写文件、运行命令和访问网络，不会把每一步都交给人确认。
+
+本机单节点时，这已经需要谨慎。多机以后，风险会放大：
+
+- 一个错误任务可以同时投递给多个节点
+- 多个节点可能在同一个仓库里并发改文件
+- 远端节点工作目录可能含有无关密钥或私有资料
+- Hub 或 token 泄漏后，攻击者可能借节点能力间接操作文件和命令
+
+最可靠的收敛方式不是只改一个字段，而是隔离工作目录：
+
+```bash
+mkdir -p ~/agent-workspaces/course-demo
+cd ~/agent-workspaces/course-demo
+
+read -r HUB_URL
+read -r MEMBER_USER
+read -rsp MEMBER_PASSWORD
+printf '\n'
+
+anet init --hub "$HUB_URL"
+anet login --username "$MEMBER_USER" --password "$MEMBER_PASSWORD"
+anet node create writer-a
+anet node start writer-a
+```
+
+如果你想手动把某个节点的 `dangerouslySkipPermissions` 改成 `false`，要按对应 runtime 实测它的行为。不要把这个字段当作“只读节点”或“RBAC 权限”的承诺，它不能替代系统用户隔离、目录隔离、token 最小权限和人工 review。
+
+## 5. network 角色：先会看，再谨慎用
+
+CLI 已经有 network 命令：
+
+```bash
+anet network ls
+anet network create course-demo
+anet network use course-demo
+anet network info
+anet network invite
+read -r INVITE_CODE
+anet network join "$INVITE_CODE"
+anet network members
+```
+
+登录或列 network 时，你会看到 `owner`、`admin`、`member`、`viewer` 等角色。入门阶段先按下面的方式理解：
+
+| 角色 | 入门理解 | 建议 |
+|---|---|---|
+| `owner` | network 所有者 | 尽量少 |
+| `admin` | 高权限管理者 | 只给需要管理成员的人 |
+| `member` | 常规协作者 | 默认协作者角色 |
+| `viewer` | 观察者 | 演示、旁听、审阅 |
+
+可以创建一个独立 network：
+
+```bash
+anet network create course-demo
+anet network use course-demo
+anet network info
+```
+
+也可以生成 member 邀请：
+
+```bash
+anet network invite --role member --uses 1
+```
+
+对方在自己的机器上加入：
+
+```bash
+read -r HUB_URL
+read -r MEMBER_USER
+read -rsp MEMBER_PASSWORD
+printf '\n'
+read -r INVITE_CODE
+
+anet init --hub "$HUB_URL"
+anet login --username "$MEMBER_USER" --password "$MEMBER_PASSWORD"
+anet network join "$INVITE_CODE"
+anet network ls
+```
+
+这里有一个必须写清的边界：这些命令和角色在 CLI / 源码里存在，但 cross-user network sharing 不是 README 主 verified flow。精确到“某个角色能不能创建节点、看哪些任务、撤销哪些 token”的 API 权限矩阵，本课 v1 不展开，也不让你在没有实测的情况下把它当唯一生产防线。
+
+可执行的保守策略是：
+
+1. 项目之间用独立 network 分开，不把演示、客户项目和生产项目混在 default network。
+2. 大多数协作者给 `member`，观察者给 `viewer`，少数维护者才给 `admin`。
+3. 安全依赖顺序始终是：Hub 不裸露、TLS、改密、最小账号、token 最小分发、目录隔离、再加 network 角色。
+
+## 6. `.anet`、token 和密钥不入库
+
+anet 配置文件位置很明确：
+
+```text
+~/.anet/config.json
+{cwd}/.anet/nodes/writer-a/config.json
+```
+
+全局配置里有用户 token；节点配置里有节点 token，可能还有 provider key 或环境变量。它们都不能进 Git。
+
+在每个 Agent 项目根目录创建或打开 `.gitignore`，加入：
+
+```gitignore
+.anet/
+.env
+*.log
+```
+
+然后检查：
+
+```bash
+git status --short
+git ls-files .anet
+```
+
+`git ls-files .anet` 应该没有输出。如果已经误提交过 `utok_`、`ntok_` 或 API key，不要只删文件然后继续用旧凭据。正确顺序是：
+
+1. 从当前文件和 Git 历史里移除泄漏内容。
+2. 按服务端能力撤销或重建相关凭据。
+3. 用户 token 用 token 管理命令撤销旧 token，或重新登录生成新 token。
+4. 节点 token 通过删除/重建节点、或当前版本提供的节点 token 轮换路径重建。
+5. provider API key 到对应 provider 控制台轮换。
+
+`anet doctor --fix` 可以帮你诊断和修复本地配置问题，例如旧配置迁移、节点缺 token、节点配置里误放 `utok_` 等；它不能替你撤销已经泄漏到 Git 历史或外部平台的有效凭据。
+
+## 7. 多机上线前安全检查
+
+在把 Hub 暴露给其他机器之前，跑一遍：
+
+```bash
+anet whoami
+anet network ls
+anet network members
+anet node ls
+anet doctor
+```
+
+再人工确认：
+
+- Hub 如果只是本机调试，保持默认本机访问。
+- 公网入口不要裸露 `:9200`，使用反向代理、TLS 和访问控制。
+- 默认 `admin/anethub` 已经改掉。
+- `utok_` 只保存在可信用户机器。
+- `ntok_` 只保存在对应节点项目目录。
+- 节点工作目录不是 `$HOME`，也不是含有无关密钥的大目录。
+- `.anet/`、`.env`、日志文件不会被 Git 跟踪。
+- `dangerouslySkipPermissions` 是有意开启，并且不被误当成权限模型。
+- network 角色只是入门分层，生产安全不只依赖它。
+
+## 8. 一套推荐的安全启动流程
+
+终端 A，在 Hub 机器上启动：
+
+```bash
+anet hub start --host 0.0.0.0
+```
+
+终端 B，在 Hub 机器或管理机器上做初始化：
+
+```bash
+anet login --username admin --password anethub
+anet passwd
+anet network create course-demo
+anet network use course-demo
+anet network invite --role member --uses 1
+```
+
+节点机器上，先准备隔离目录，并确保 `.gitignore` 包含 `.anet/`、`.env` 和日志：
+
+```bash
+mkdir -p ~/agent-workspaces/course-demo
+cd ~/agent-workspaces/course-demo
+
+read -r HUB_URL
+read -r MEMBER_USER
+read -rsp MEMBER_PASSWORD
+printf '\n'
+read -r INVITE_CODE
+
+anet init --hub "$HUB_URL"
+anet login --username "$MEMBER_USER" --password "$MEMBER_PASSWORD"
+anet network join "$INVITE_CODE"
+anet node create writer-a
+anet doctor
+anet node start writer-a
+```
+
+回到任意已登录机器检查：
+
+```bash
+anet status
+anet network members
+```
+
+演示结束后，停节点、清理临时成员或删除临时 network。删除 network 是破坏性操作，只在确认没有其他人使用时执行：
+
+```bash
+anet network delete course-demo --force
+```
+
+## 总结
+
+多机安全不是某一个按钮。`--host 0.0.0.0` 只解决连通性，不解决安全性；`utok_` 和 `ntok_` 是不同层级的凭据；`dangerouslySkipPermissions` 是节点运行姿态，不是权限模型；network 角色能帮助分层，但当前 v1 不把它写成唯一生产边界。
+
+把 Hub 入口、TLS、默认密码、账号、token、工作目录、Git 忽略规则和 network 角色一起收口，你才能把 anet 从本机玩具变成可控的多机 Agent 团队。

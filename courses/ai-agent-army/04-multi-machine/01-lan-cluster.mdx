@@ -1,0 +1,270 @@
+---
+title: "把 Hub 开放到局域网 — 多台机器的 Agent 组一个网"
+order: 1
+estimated_minutes: 16
+---
+
+# 把 Hub 开放到局域网 — 多台机器的 Agent 组一个网
+
+> 单机 anet 是一队 Agent 在同一台机器上协作；局域网 anet 是把 Hub 留在一台稳定机器上，让多台机器的 Agent 都连进同一个任务网络。
+
+## 0. 一句话先讲明白
+
+**在 Hub 机器上用 `anet hub start --host 0.0.0.0` 监听局域网地址，再让其他机器把 `HUB_URL` 指向这台 Hub、登录、创建并启动 `writer-a` / `reviewer-b` 这类 Agent alias，多台机器就会进入同一个 CommHub。**
+
+这节只讲局域网，不讲公网。局域网的目标是让同一办公室、同一家庭实验室、同一内网环境里的机器共享一个 Hub：一台机器负责跑 Hub 和 Dashboard，其他机器负责跑 Agent 节点。公网部署必须加 TLS、改密、反代和端口收敛，下一节单独讲。
+
+---
+
+## 你将学到
+
+- `anet hub start` 默认为什么只监听 `127.0.0.1`
+- `--host 0.0.0.0` 改变了什么，以及它不等于“安全开放”
+- 如何在另一台机器上用 `anet init --hub` 或 `anet login --hub` 指向同一个 Hub
+- 为什么跨机第一步要先登录，再创建和启动节点
+- 如何用网络连通性、端口、防火墙、Hub health 来排查连接失败
+- 为什么局域网可以开放 `:9200`，但不要把裸 `:9200` 暴露到公网
+
+## 适合谁
+
+已经完成本地 quickstart，知道 `anet hub start`、`anet login`、`anet node create`、`anet node start` 基本流程的工程师或进阶创作者。你不需要会 Kubernetes，也不需要会服务网格；只需要会打开终端、识别本机 IP、修改防火墙规则。
+
+---
+
+## 1. 先定一个最小拓扑
+
+本节使用一个三机示例，机器只按角色命名，不写真实主机名：
+
+| 角色 | 运行内容 |
+|---|---|
+| Hub 机器 | CommHub Server，可选 Dashboard |
+| Agent 机器 A | 一个或多个 anet node |
+| Agent 机器 B | 一个或多个 anet node |
+
+真实操作时，把 Hub 的局域网地址放进临时变量 `HUB_URL`。不要把公网 IP、真实内网资产名、真实域名写进课程笔记、截图或公开仓库里。
+
+最小拓扑的关键是：**Hub 只有一个，Agent 可以很多个。** Agent 不需要互相直连，它们都通过 Hub 做状态发现、任务投递、消息记录和 SSE 推送。这样网络配置会简单很多：只要每台 Agent 机器能访问 Hub 的 `:9200`，整个集群就能跑起来。
+
+---
+
+## 2. 在 Hub 机器上开放局域网监听
+
+单机 quickstart 里我们用的是：
+
+```bash
+anet hub start
+```
+
+这个命令默认绑定 `127.0.0.1`，只允许本机访问。默认值是安全的：你在本机开发时，不会无意把管理入口开放给同网段其他设备。
+
+现在要让局域网里的其他机器访问 Hub，需要显式绑定所有网卡：
+
+```bash
+anet hub start --host 0.0.0.0
+```
+
+README 的 LAN verified flow 使用 `anet hub start --host 0.0.0.0` 作为局域网 Hub 启动方式；CLI 源码里 `hub start` 的默认 host 是 `127.0.0.1`。也就是说，这不是隐藏参数，而是 anet 支持的局域网共享方式。
+
+启动后保持这个终端运行。Hub 是前台进程，按 `Ctrl+C` 会停止。实战里你可以用 `tmux` 或系统服务托管，但本节先保持最少变量：一个终端跑 Hub，另一个终端跑 Dashboard 或 CLI。
+
+如果你还想在浏览器里看节点状态，可以在 Hub 机器另开一个终端：
+
+```bash
+anet hub dashboard
+```
+
+Dashboard 默认是本机开发入口。局域网共享时，先把它当成 Hub 机器上的辅助观察工具；如果要让 Dashboard 也被其他机器访问，同样要纳入防火墙和访问控制设计。课程后面的 Dashboard 章节会展开界面读法，本节只依赖 CLI 验证。
+
+---
+
+## 3. 确认 Hub 机器的局域网地址
+
+你需要知道其他机器应该连哪个地址。实际环境里可以用系统网络工具查看 Hub 机器的局域网 IP，例如 Linux 上常见的是：
+
+```bash
+ip addr
+```
+
+macOS 上常见的是：
+
+```bash
+ifconfig
+```
+
+不要盲目复制命令输出里的第一个地址。你要找的是和其他 Agent 机器在同一网段、能互相访问的地址。拿到地址后，在当前终端设置变量：
+
+```bash
+read -r HUB_LAN_IP
+HUB_URL="http://${HUB_LAN_IP}:9200"
+printf '%s\n' "$HUB_URL"
+```
+
+拿到地址后，在 Hub 机器本机先检查服务是否正常：
+
+```bash
+curl http://127.0.0.1:9200/health
+```
+
+再用局域网地址检查一次：
+
+```bash
+curl "$HUB_URL/health"
+```
+
+第一条通、第二条不通，通常说明 Hub 没有按 `0.0.0.0` 监听，或者本机防火墙挡住了局域网入口。两条都不通，先回到 Hub 终端看进程是否仍在运行。
+
+---
+
+## 4. 在另一台机器上指向同一个 Hub
+
+来到 Agent 机器 A。先安装 CLI：
+
+```bash
+npm install -g @sleep2agi/agent-network
+anet -v
+```
+
+然后把全局 Hub 地址写入 `~/.anet/config.json`：
+
+```bash
+read -r HUB_LAN_IP
+HUB_URL="http://${HUB_LAN_IP}:9200"
+anet init --hub "$HUB_URL"
+```
+
+`anet init --hub "$HUB_URL"` 在 README 的命令参考里标注为写入全局配置的 LAN setup 路径；源码里 `initGlobal()` 会请求 `${hub}/health`，能连通才保存配置。因此这一步既是配置，也是一次基本连通性检查。
+
+如果你的 anet 版本支持在登录时直接传 Hub，也可以使用同一口径：
+
+```bash
+anet login --hub "$HUB_URL" --username admin --password anethub
+```
+
+两种写法的目的相同：让这台机器的 CLI 后续都知道 Hub 在哪里。为了减少变量，推荐先执行 `anet init --hub ...`，再执行登录：
+
+```bash
+anet login --username admin --password anethub
+```
+
+默认管理员账号来自 `anet hub start` 的 bootstrap：用户名 `admin`，默认密码 `anethub`。这是 quickstart 口径，不是生产口径。局域网里做临时实验可以用它完成第一次登录；只要进入更长期的共享环境，就应该改密。下一节会把改密放进公网部署流程。
+
+登录成功后，`~/.anet/config.json` 会保存 Hub 地址、用户 token 和当前 network 信息。后续 `anet node create`、`anet node start` 会使用这些配置。
+
+---
+
+## 5. 创建并启动第一个跨机节点
+
+在 Agent 机器 A 上创建一个节点：
+
+```bash
+anet node create writer-a
+```
+
+这里的 `writer-a` 是 Agent alias，不是机器名。真实环境可以换成更能表达职责的别名，但不要包含敏感项目名或真实机器名。`anet node create` 会进入交互式选择：先选 runtime，再选 provider 或复用本机已登录的运行时。不同机器可以使用不同模型供应商，Hub 不要求它们一致。
+
+创建完成后启动：
+
+```bash
+anet node start writer-a
+```
+
+`anet node start writer-a` 会把节点进程连到 Hub，等待任务。看到 SSE connected 或类似连接成功信息，就说明这个 Agent 已经进入同一个网络。
+
+再到 Agent 机器 B 重复流程，只是换一个节点名：
+
+```bash
+read -r HUB_LAN_IP
+HUB_URL="http://${HUB_LAN_IP}:9200"
+anet init --hub "$HUB_URL"
+anet login --username admin --password anethub
+anet node create reviewer-b
+anet node start reviewer-b
+```
+
+多机协作时，节点名是人和 Agent 都会看到的协作标识。建议用短、稳定、无敏感信息的名字，例如 `writer-a`、`reviewer-b`、`runner-c`。不要用真实员工名、客户名、线上主机名。
+
+---
+
+## 6. 验证多机 Agent 已经在同一个网
+
+在任意已经登录 Hub 的机器上运行：
+
+```bash
+anet status
+```
+
+这个命令会显示网络概览，包括已连接 Agent 和任务状态。也可以列出本项目下创建的节点：
+
+```bash
+anet node ls
+```
+
+如果你启动了 Dashboard，可以在浏览器里观察节点列表、Tasks、Messages。跨机协作的本质不是“机器互相 ssh”，而是 Agent 通过 CommHub 的 MCP 工具发现彼此：一个 Agent 查询在线状态，把任务发给另一个 Agent，再轮询任务结果，最后整合回复。
+
+你可以做一个最小验证：在 Agent 机器 A 上运行的 `writer-a` 里，让它询问 Agent 机器 B 上的 `reviewer-b` 能做什么。只要两边都连到同一个 Hub，并且都在同一个 network，任务就会出现在 Hub 记录里。
+
+---
+
+## 7. 网络和防火墙检查清单
+
+跨机失败时，不要先怀疑 Agent。先按网络层从下往上排查。
+
+第一层，Hub 进程是否在：
+
+```bash
+curl http://127.0.0.1:9200/health
+```
+
+第二层，Hub 是否监听了局域网地址：
+
+```bash
+curl "$HUB_URL/health"
+```
+
+第三层，从 Agent 机器访问 Hub：
+
+```bash
+curl "$HUB_URL/health"
+```
+
+第四层，anet 配置是否写对：
+
+```bash
+anet whoami
+anet status
+```
+
+第五层，本机诊断：
+
+```bash
+anet doctor
+```
+
+如果 `curl` 在 Agent 机器上超时，通常是网络或防火墙问题：两台机器不在同一网络、路由不通、Hub 机器防火墙没有放行 `9200/tcp`、公司网络隔离了客户端互访。如果 `curl` 通但 `anet login` 失败，才进入账号密码、Hub URL、token、network 这些应用层问题。
+
+防火墙只需要让 Agent 机器访问 Hub 的 `9200/tcp`。不需要让所有 Agent 机器互相开放端口。能收敛的入口越少，后续越好维护。
+
+---
+
+## 8. 不要把裸 Hub 暴露到公网
+
+`anet hub start --host 0.0.0.0` 的意思是监听所有网卡，不是“只监听局域网”。如果这台机器有公网网卡、云服务器安全组放开了 `9200`、路由器做了端口转发，Hub 就可能直接暴露在公网。
+
+这在公网环境里不合格，原因很直接：
+
+- 默认管理员账号是公开约定的 `admin/anethub`
+- 裸 HTTP 没有 TLS，登录凭据和 token 可能被中间网络观察
+- `:9200` 是 Hub 的应用端口，不应该直接成为公网入口
+- Agent 节点通常有读写文件、执行命令、调用模型的能力，暴露控制面会放大风险
+
+局域网实验可以使用 `HUB_URL` 指向 Hub 机器的局域网地址。一旦跨城市、跨网络、云服务器、公网访问，就进入下一节的部署方式：Hub 只监听 `127.0.0.1:9200`，公网只开放 `443`，用 Caddy 做 HTTPS 反代，并在启动 Hub 和 Dashboard 后立刻用 `anet passwd` 修改默认密码。
+
+---
+
+## 总结
+
+局域网多机部署的核心只有三步：Hub 机器执行 `anet hub start --host 0.0.0.0`，Agent 机器用 `HUB_URL` 执行 `anet init --hub "$HUB_URL"` 和 `anet login --username admin --password anethub`，然后各自 `anet node create`、`anet node start`。
+
+排障时先看网络，再看 anet：Hub 本机 health、局域网 health、Agent 机器 curl、防火墙、`anet whoami`、`anet status`。不要把跨机连接问题直接归因给模型或 runtime。
+
+最重要的边界是安全边界：`--host 0.0.0.0` 适合受控局域网，不适合裸露公网。公网部署必须走 TLS 反代、改密和端口收敛。

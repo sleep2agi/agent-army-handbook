@@ -1,0 +1,380 @@
+---
+title: "anet project — 一条命令拉起整个多节点项目"
+order: 4
+estimated_minutes: 16
+---
+
+# anet project — 一条命令拉起整个多节点项目
+
+> 三个 Agent 还可以手动开三个终端；到了五个、十个节点，你需要的是项目级启停，而不是靠记忆管理一堆 tmux 窗口。
+
+## 0. 一句话先讲明白
+
+`anet project` 把当前目录下的一组节点当成一个项目来管理：扫描 `cwd/.anet/nodes/`，用 `anet project up` 拉起整队 Agent，用 `restart` 成组刷新，用 `down` 成组停止；`--stagger` 控制错峰，`--only` / `--exclude` 控制范围。它不是新的 `project.yaml` 配置格式，事实来源仍然是每个节点自己的 `config.json`。
+
+## 你将学到
+
+- `anet project up / restart / down` 分别做什么
+- `anet project` 如何发现节点：只看当前目录的 `.anet/nodes/`
+- `--stagger`、`--only`、`--exclude` 的实际用法
+- 它和单节点 `anet node start writer-a` 的区别
+- `config.json` 里哪些字段决定节点能否被拉起
+- `anet create --batch` 和 project 命令的边界
+
+## 适合谁
+
+已经能创建单个节点，开始需要 3 个以上 Agent 分工协作的读者。典型场景包括 reviewer 小队、内容生产小队、代码修改 + 测试 + 总结小队。
+
+## 1. 从单节点到项目级启停
+
+单节点路径是：
+
+```bash
+anet node create writer-a
+anet node start writer-a
+```
+
+这适合第一次验证。多节点项目会很快变成重复劳动：
+
+```bash
+anet node start researcher
+anet node start coder
+anet node start reviewer
+anet node start reporter
+```
+
+`anet --help` 里有专门的项目级命令块：
+
+```text
+Project (cwd-wide):
+  anet project up                Start every node in cwd (skip already-running)
+  anet project restart           Kill existing tmux + start fresh (every node)
+  anet project down              Stop every node + notify hub offline
+  --stagger <s>                  Delay between nodes (default: 3, 0 disables)
+  --only a,b / --exclude x,y     Filter by alias or node id
+```
+
+关键词是 `cwd-wide`：它管理的是“当前目录”这个项目，不是全机器所有节点。
+
+## 2. project 扫描哪里
+
+`anet project` 扫描：
+
+```text
+{cwd}/.anet/nodes
+```
+
+典型目录是：
+
+```text
+review-team/
+  .gitignore
+  README.md
+  .anet/
+    nodes/
+      researcher/
+        config.json
+      coder/
+        config.json
+      reviewer/
+        config.json
+```
+
+所以你在哪里运行命令很重要：
+
+```bash
+cd ~/agent-workspaces/review-team
+anet project up
+```
+
+这会扫描 `~/agent-workspaces/review-team/.anet/nodes/`。如果你在上一级目录运行，CLI 会找上一级的 `.anet/nodes/`，不会递归进入每个子项目。
+
+network 决定节点接入哪个协作空间；`cwd/.anet/nodes/` 决定当前命令会启停哪些本地节点。两个概念相关，但不是一回事。
+
+## 3. 节点配置文件结构
+
+`anet node create` 会在 `.anet/nodes/writer-a/config.json` 这类路径写节点配置。你不需要手写这个文件，但要能看懂关键字段：
+
+```json
+{
+  "node_id": "n_example",
+  "node_name": "researcher",
+  "alias": "researcher",
+  "hub": "$HUB_URL",
+  "token": "ntok_...",
+  "runtime": "claude-agent-sdk",
+  "channels": ["server:commhub"],
+  "flags": {
+    "dangerouslySkipPermissions": true
+  }
+}
+```
+
+`project up` 关心的是：这个节点在当前目录的 `.anet/nodes/` 下，配置能被读取，token 是节点级 `ntok_`，runtime 和环境变量足够让 `anet node start "$ALIAS"` 跑起来。
+
+如果配置缺 token，或者节点配置里误放了 `utok_`，`project` 会把它标成 invalid，并提示你先修配置。
+
+## 4. 准备一个三节点项目
+
+先准备目录和 Git 忽略规则。创建或打开 `.gitignore`，加入：
+
+```gitignore
+.anet/
+.env
+*.log
+```
+
+然后创建项目：
+
+```bash
+mkdir -p ~/agent-workspaces/review-team
+cd ~/agent-workspaces/review-team
+
+read -r HUB_URL
+read -r MEMBER_USER
+read -rsp MEMBER_PASSWORD
+printf '\n'
+
+anet init --hub "$HUB_URL"
+anet login --username "$MEMBER_USER" --password "$MEMBER_PASSWORD"
+anet network use course-demo
+```
+
+创建三个节点：
+
+```bash
+anet node create researcher
+anet node create coder
+anet node create reviewer
+```
+
+检查配置是否在当前目录：
+
+```bash
+find .anet/nodes -maxdepth 2 -type f -name config.json
+```
+
+应看到：
+
+```text
+.anet/nodes/researcher/config.json
+.anet/nodes/coder/config.json
+.anet/nodes/reviewer/config.json
+```
+
+这些文件里有 `ntok_...`，所以 `.anet/` 必须被 Git 忽略。
+
+## 5. `anet project up`：拉起整组
+
+启动整个项目：
+
+```bash
+anet project up
+```
+
+默认会在节点之间等待 3 秒。这个错峰由 `--stagger` 控制，用来避免一组节点同时启动时打满机器、模型服务或 Hub。
+
+本机演示可以取消等待：
+
+```bash
+anet project up --stagger 0
+```
+
+`project up` 会为每个节点创建 detached tmux session，里面运行对应的：
+
+```bash
+ALIAS=writer-a
+anet node start "$ALIAS"
+```
+
+如果某个节点已经有同名 tmux session 在运行，`project up` 会跳过它，而不是强制重启。这让它适合日常反复执行：不确定谁还活着时，跑一遍 `project up`，只会补齐没起来的节点。
+
+## 6. `--only` 和 `--exclude`：控制范围
+
+只启动 researcher 和 reviewer：
+
+```bash
+anet project up --only researcher,reviewer
+```
+
+只重启 coder：
+
+```bash
+anet project restart --only coder --stagger 0
+```
+
+除了 reviewer，其他都重启：
+
+```bash
+anet project restart --exclude reviewer --stagger 1
+```
+
+只停 reviewer：
+
+```bash
+anet project down --only reviewer
+```
+
+`--only` 和 `--exclude` 不会修改配置文件，只影响本次命令选中的节点集合。
+
+## 7. `restart` 和 `down`
+
+成组刷新：
+
+```bash
+anet project restart
+```
+
+`restart` 会杀掉已有 tmux session，执行停止逻辑，再重新创建 tmux session。配置调整后，用它比手动找每个 tmux 窗口可靠。
+
+停止整个项目：
+
+```bash
+anet project down
+```
+
+停止时 CLI 会杀掉对应 tmux session，执行本地 stop 逻辑，并尝试通知 Hub 节点离线。Hub 不可达时不会长期卡住 teardown。
+
+停完以后检查：
+
+```bash
+anet node ls
+anet status
+```
+
+## 8. 和单节点启动的区别
+
+| 命令 | 范围 | 运行方式 | 适合场景 |
+|---|---|---|---|
+| `anet node start writer-a` | 单个节点 | 默认前台运行 | 第一次调试、观察实时输出 |
+| `anet node start writer-a --tmux` | 单个节点 | 新 tmux session 并 attach | 单节点放进 tmux |
+| `anet project up` | 当前目录多个节点 | detached tmux 批量启动 | 日常拉起一组 Agent |
+| `anet project restart` | 当前目录匹配节点 | kill + start | 配置调整后刷新整组 |
+| `anet project down` | 当前目录匹配节点 | kill + offline 通知 | 收工、切项目、释放资源 |
+
+新角色第一次创建后，建议先单节点前台启动一次：
+
+```bash
+anet node start researcher
+```
+
+确认能连上 Hub 后，再交给 project 管理：
+
+```bash
+anet project up --only researcher
+```
+
+这样能把“节点配置是否正确”和“批量启停是否正确”分开排查。
+
+## 9. `anet create --batch` 的边界
+
+架构里提到批量建一队 Agent。当前 CLI 的确有：
+
+```bash
+anet create --batch --help
+```
+
+它支持 `--workdir`、`--workdir-mode`、`--prefix`、`--count`、`--description`、`--leader-alias` 等参数，可以快速生成多个节点。
+
+但本节只把它当可选入口：
+
+- 它用于批量创建节点，不是 project 管理的核心命令。
+- `anet project` 不读取 `project.yaml`、`agents.json` 或其他你想象中的项目配置文件。
+- batch lifecycle 帮助里有 Phase 1 边界说明，不要把 `anet batch start` 当成本节主路径。
+- 最终能否被 `project` 管理，仍然取决于当前目录下有没有 `.anet/nodes/writer-a/config.json` 这类节点配置。
+
+保守做法是：先用 `anet node create` 跑通三节点项目；确认理解 `project up/restart/down` 后，再用 `anet create --batch` 提高创建效率。
+
+## 10. 完整命令流
+
+下面是一套从零准备三节点项目、启动、局部重启、停止的命令流。
+
+```bash
+# 1. 准备目录
+mkdir -p ~/agent-workspaces/review-team
+cd ~/agent-workspaces/review-team
+
+# 2. 连接 Hub + network
+read -r HUB_URL
+read -r MEMBER_USER
+read -rsp MEMBER_PASSWORD
+printf '\n'
+
+anet init --hub "$HUB_URL"
+anet login --username "$MEMBER_USER" --password "$MEMBER_PASSWORD"
+anet network use course-demo
+
+# 3. 创建节点
+anet node create researcher
+anet node create coder
+anet node create reviewer
+
+# 4. 本地安全与配置检查
+git status --short
+git ls-files .anet
+anet doctor
+
+# 5. 拉起整组
+anet project up --stagger 1
+anet status
+
+# 6. 只重启一个角色
+anet project restart --only coder --stagger 0
+anet logs coder
+
+# 7. 停掉整组
+anet project down
+anet status
+```
+
+`git ls-files .anet` 应该没有输出。如果有，先处理 Git 跟踪和 token 轮换，不要继续把这个目录当作安全项目使用。
+
+## 11. 常见问题
+
+`anet project up` 输出 No nodes match：
+
+```bash
+pwd
+find .anet/nodes -maxdepth 2 -type f -name config.json
+```
+
+确认你在正确项目根目录。
+
+summary 里出现 invalid：
+
+```bash
+anet doctor
+anet doctor --fix
+```
+
+常见原因是节点配置缺 token，或者旧配置里把 `utok_` 放进了节点 token 字段。节点需要 `ntok_`。
+
+某个节点没有起来：
+
+```bash
+ALIAS=writer-a
+anet logs "$ALIAS"
+anet info "$ALIAS"
+```
+
+如果刚改过 provider key、model 或 runtime，先前台启动看完整错误：
+
+```bash
+ALIAS=writer-a
+anet node start "$ALIAS"
+```
+
+确认能正常启动后再回到：
+
+```bash
+ALIAS=writer-a
+anet project restart --only "$ALIAS" --stagger 0
+```
+
+## 总结
+
+`anet project` 的价值是把多节点项目从“手动逐个启动”变成“按当前目录成组管理”。规则很简单：扫描 `cwd/.anet/nodes/`，`up` 跳过已运行节点，`restart` 强制刷新，`down` 成组停止；`--stagger` 控制启动节奏，`--only` 和 `--exclude` 控制范围。
+
+不要给它添加不存在的配置语义。创建节点仍然走 `anet node create`，批量创建可以用 `anet create --batch`，但 project 管理的事实来源始终是当前目录下的 `.anet/nodes/writer-a/config.json` 这类节点配置。
+
+下一章会进入 Web Dashboard：用界面看这些 project 拉起的节点是否在线、任务链路是否卡住、消息历史是否符合预期。
