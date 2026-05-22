@@ -1,0 +1,314 @@
+---
+title: "Dashboard 看板（二）— Tasks 任务追踪 + Messages 消息历史"
+order: 2
+estimated_minutes: 18
+---
+
+# Dashboard 看板（二）— Tasks 任务追踪 + Messages 消息历史
+
+> 多 Agent 协作最怕的不是报错，而是"看起来谁都没动"。Tasks 和 Messages 的价值，就是把一次派活从发出、接收、执行到回复的痕迹摆到你眼前。
+
+## 0. 一句话先讲明白
+
+**Tasks 看"任务现在卡在哪"，Messages 看"当时到底说了什么"；两者合起来，能从 Dashboard 追完一次 multi-agent handshake。**
+
+CH2 L03 已经讲过 Mesh debug 的底层方法：必要时直接查 `~/.commhub/commhub.db`，用 `tasks.parent_task_id` 和 `task_events` 还原链路。本节不重复协议细节，只讲 Dashboard 里的实战读法：打开 Tasks、对照 Messages、再用 CLI 做交叉验证。
+
+---
+
+## 你将学到
+
+- Tasks 面板里怎么读 `from` / `to` / `status` / `content`
+- Messages 面板适合查哪些历史，而不是把它当任务状态机
+- 如何从 Dashboard 追一次 `writer-a` 到 `reviewer-b` 的 multi-agent handshake
+- 数据没刷新、历史截断、状态滞后三类常见坑怎么判断
+- 什么时候从 Dashboard 切回 CLI 或 CH2 的 SQLite 诊断流程
+
+## 适合谁
+
+已经完成 CH1 Dashboard 初识，并读过 CH2 L03 Mesh 派活诊断的读者。你不需要记住全部状态机字段，但应该知道 `send_task`、`send_reply`、`parent_task_id` 这些词分别指什么。
+
+---
+
+## 1. 先分清“卡在哪”和“说了什么”
+
+Tasks 面板回答的是：
+
+- 这条任务是谁发给谁的？
+- 当前状态是 `delivered`、`acked`、`running`、`replied`，还是 `failed`、`cancelled`、`expired`？
+- 最近的任务内容是什么？
+- 一次协作里有没有父任务、子任务或连续派活？
+
+Messages 面板回答的是：
+
+- 发件方和收件方之间实际留下了哪些消息记录？
+- 同一轮协作里，消息顺序有没有乱？
+- Chat 或 Agent 回复后，历史里还能不能看到上下文？
+- 任务状态看起来正常时，内容是不是发错对象、发错意图、或被上游改写了？
+
+一个实用判断：**先看 Tasks 定位链路，再看 Messages 读内容。** 如果 Tasks 已经显示 `failed` 或长时间停在 `running`，Messages 只能补充现场，不能替代状态诊断。
+
+---
+
+## 2. 先准备一个可观察的 handshake
+
+为了讲清楚，我们用两个固定别名：
+
+- `writer-a`：发起任务的节点
+- `reviewer-b`：接收任务并回复的节点
+
+Dashboard 的入口仍然是本地 Web UI：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet hub dashboard --port 3000
+```
+
+浏览器打开 `http://127.0.0.1:3000`，确认左侧导航里能看到 Tasks 和 Messages。
+
+本节用课程里的别名来模拟一次可观察的 handshake：让 `writer-a` 通过 CommHub 派活给 `reviewer-b`，再从 Dashboard 追它。
+
+你可以从 Chat 面板发起，也可以让 Agent 在自己的会话里调用 `send_task`。重点不是入口，而是后面的观测顺序。
+
+---
+
+## 3. 追到任务卡在哪
+
+进入 `http://127.0.0.1:3000` → Tasks。一次正常 handshake，至少要看四列：
+
+| 字段 | 怎么读 |
+|---|---|
+| `status` | 当前任务状态，先看它是否进入终态 |
+| `from` | 发起方，例：`writer-a` |
+| `to` | 接收方，例：`reviewer-b` |
+| `content` | 任务内容摘要，用来确认是不是同一条任务 |
+
+一次正常 `send_task` 更接近这条链路：
+
+```text
+delivered -> acked -> running -> replied
+```
+
+`running` 不是每条任务都一定明显停留，但 `acked` 很重要：它表示目标 Agent 已经确认收到。终态除了 `replied`，还可能是 `failed`、`cancelled` 或 `expired`。
+
+Dashboard Chat 里有时会先出现 `created` 这类瞬时状态，那更像 UI 刚创建气泡或数据库兜底记录，不要把它当成 Hub 任务的标准长期状态。Tasks 面板里真正有排障价值的是：任务是否 `delivered`、是否 `acked`、是否进入 `running`、最终是 `replied` 还是失败类终态。
+
+追链路时按这个顺序扫：
+
+1. 找 `from = writer-a`、`to = reviewer-b` 的最新任务。
+2. 看 `status` 是否还在变化。
+3. 用 `content` 确认它就是你刚发的那条任务。
+4. 如果出现子任务，继续找同一时间窗口里新的 `from` / `to` 组合。
+
+状态含义可以先按这张表记：
+
+| 状态 | 更可能卡在哪 |
+|---|---|
+| `delivered` 很久不变 | Hub 已写入并尝试推送，但目标 Agent 可能不在线、alias/network 不对、SSE 不通 |
+| `acked` 很久不变 | 目标 Agent 收到了，但还没真正跑起来，查 runtime、工具或模型前置条件 |
+| `running` 很久不变 | Agent 正在执行或卡住，查日志、模型调用、工具调用和子任务 |
+| `replied` | 任务已回复，去 Messages 看内容是否符合预期 |
+| `failed` | 执行失败，查失败回复和节点日志 |
+| `expired` | 任务被 Hub 接受但长期没有完成，重点查目标 alias、network、SSE 和目标节点是否在线 |
+| `cancelled` | 人或流程取消了任务，回看是谁在什么时候取消 |
+
+这里不要脑补不存在的图形链路。Dashboard Tasks 的核心价值是列表化、时间化地暴露任务状态；复杂父子树还原仍然回到 CH2 L03 的 SQLite 递归查询。
+
+---
+
+## 4. 用 CLI 给 Tasks 做交叉验证
+
+Dashboard 是最适合肉眼扫描的入口，但 CLI 更适合复制、保存和远程排障。
+
+`anet status` 的实现会从 `/api/tasks?limit=10` 拉 recent tasks，并打印任务的 `status`、`from`、`to`、`content`。所以当 Dashboard 里看到异常时，先跑：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet status
+```
+
+你要关注 `Recent Tasks` 区块，而不是只看节点数量。它能快速回答："Hub 最近到底记录了哪些任务？"
+
+再用 `anet tasks` 缩小范围。它支持 `status` 和 `limit`，输出包含 task status、from、to、age、content。先准备一次环境：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+```
+
+然后看最近任务：
+
+```bash
+anet tasks --limit 10
+```
+
+只看正在执行的任务：
+
+```bash
+anet tasks --status running --limit 20
+```
+
+只看已回复的任务：
+
+```bash
+anet tasks --status replied --limit 20
+```
+
+只看失败的任务：
+
+```bash
+anet tasks --status failed --limit 20
+```
+
+如果你怀疑目标节点根本没收到任务，再看卡在投递侧的任务：
+
+```bash
+anet tasks --status delivered --limit 20
+```
+
+如果 CLI 能看到新任务，但 Dashboard 没更新，优先怀疑浏览器侧数据刷新；如果 CLI 和 Dashboard 都看不到，说明任务可能根本没写进 Hub，下一步查发起方日志。
+
+```bash
+anet logs writer-a
+```
+
+---
+
+## 5. 查清当时说了什么
+
+Tasks 告诉你状态，Messages 告诉你内容。
+
+进入 Messages 面板后，按时间顺序看 `writer-a` 和 `reviewer-b` 之间的消息。你要确认三件事：
+
+1. `writer-a` 发出的内容是不是你期望的任务。
+2. `reviewer-b` 是否产生过回复或中间消息。
+3. 多条消息的顺序是否和你在 Chat 或 CLI 里看到的一致。
+
+Messages 的价值是按时间还原内容顺序。这对排查"看起来任务完成了，但回复引用了上一条上下文"很关键。你不需要在 Messages 里理解完整协议，只要把它当成一份通信记录。
+
+一个常见读法：
+
+| Tasks 现象 | Messages 里看什么 |
+|---|---|
+| `replied` 但结果不对 | 看原始任务内容是否表达错了 |
+| `running` 很久 | 看是否只有发出记录，没有后续回复 |
+| `failed` | 看失败前最后一条内容是否暴露触发条件 |
+| 多轮连续派活混在一起 | 用时间和 `from` / `to` 对齐同一轮 handshake |
+
+Messages 不是审计万能镜。它适合查"说了什么、顺序如何"，不适合独立判断"任务为什么卡住"。状态仍然以 Tasks 和 CLI 为准。
+
+---
+
+## 6. 从 Dashboard 追一次完整 handshake
+
+下面是一套固定动作，适合你每次 demo 或排障时照着走。
+
+### 6.1 发起前先清楚预期
+
+这次我们期望看到：
+
+```text
+writer-a → reviewer-b：派出任务
+reviewer-b → writer-a：返回结果
+Tasks：任务最终进入 replied，或明确进入 failed
+Messages：保留这轮往返消息顺序
+```
+
+### 6.2 发起任务后先看 Tasks
+
+打开 Tasks，找到最新的 `writer-a → reviewer-b`。如果状态还在变化，等几秒再看。Dashboard 是观测界面，不要因为第一眼停在 `delivered` 或 `running` 就立刻判定失败。
+
+你真正要警惕的是三种情况：
+
+- 长时间停在 `running`：Agent 可能还在处理，也可能执行过程卡住。
+- 很快进入 `failed`：先看 Messages 和 `anet logs reviewer-b`。
+- Dashboard 没有新任务：用 `anet status` 验证 Hub recent tasks。
+
+### 6.3 再看 Messages
+
+进入 Messages，用 `writer-a`、`reviewer-b` 和时间顺序对齐刚才那条任务。
+
+如果 Tasks 是 `replied`，Messages 里应该能看到这轮往返的内容痕迹。你的排障动作就是把这两个页面对齐读：Tasks 判断状态，Messages 判断内容。
+
+### 6.4 最后用 CLI 固化现场
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet status
+anet tasks --limit 10
+```
+
+如果要继续深挖父子任务链路，跳回 CH2 L03 的递归 SQL。Dashboard 负责第一视角定位，SQLite 负责完整还原。
+
+---
+
+## 7. 三个常见坑
+
+### 7.1 数据没刷新
+
+症状：你刚发了任务，CLI 已经能看到，但 Dashboard 页面还停在旧列表。
+
+先做两步：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet status
+```
+
+然后刷新 `http://127.0.0.1:3000`。如果刷新后恢复，说明是浏览器页面状态滞留，不是 Hub 没记录。
+
+判断原则：**CLI 是当前 Hub API 的直接投影，Dashboard 是更适合观察的 UI。两者不一致时，先信 CLI，再刷新 Dashboard。**
+
+### 7.2 历史截断
+
+症状：Messages 里只能看到最近一段，早一点的 handshake 不在当前页面。
+
+这不等于历史不存在。Dashboard 页面为了可用性通常只展示近期记录；CLI 也有 `limit` 参数。先把 CLI 范围调大：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet tasks --limit 50
+```
+
+如果你要追很久以前的父子链路，回到 CH2 L03，用 SQLite 查 `tasks`、`task_events` 和 `parent_task_id`。Dashboard 适合快速定位，不适合替代离线取证。
+
+### 7.3 状态滞后
+
+症状：Tasks 一度显示 `running`，但 Messages 或 Chat 里已经看到回复；几秒后 Tasks 才变成 `replied`。
+
+这是多界面刷新节奏不同造成的观感差异。处理方式很简单：
+
+1. 等几秒观察状态是否推进。
+2. 用 `anet tasks --limit 10` 看 Hub 最新状态。
+3. 如果长时间不变，再按 CH2 L03 的 Ghost Task 流程排查。
+
+不要把瞬时滞后当成协议错误。真正的问题是"长时间不推进"，不是"两个面板在一两秒内显示不完全一致"。
+
+---
+
+## 8. 什么时候回到 CH2 的 mesh-debug
+
+Dashboard 能帮你快速发现异常，但下面这些情况要回到 CH2 L03：
+
+- 你要重建一整棵父子任务树。
+- `running` 挂了很久，需要查 `task_events` 最后一跳。
+- `failed` 或 `expired` 很多，需要批量统计。
+- `from` / `to` 看起来像发错对象，需要确认底层记录。
+- 你怀疑同一轮协作里出现了 task ID 漂移。
+
+可以把两节课的分工记成一句话：
+
+**CH5 L02 用 Dashboard 找现场；CH2 L03 用 SQLite 还原证据链。**
+
+---
+
+## 总结
+
+本节的核心动作是：先在 Tasks 找 `writer-a → reviewer-b` 的任务状态，再到 Messages 对齐同一时间窗口的消息内容，最后用 `anet status` 和 `anet tasks` 做交叉验证。
+
+Tasks 负责回答"卡在哪"，Messages 负责回答"说了什么"。遇到数据没刷新、历史截断、状态滞后时，不要急着改 Agent；先用 CLI 确认 Hub 记录，再决定是否回到 CH2 L03 做 SQLite 级别的链路还原。

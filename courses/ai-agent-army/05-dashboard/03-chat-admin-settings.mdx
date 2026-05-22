@@ -1,0 +1,250 @@
+---
+title: "Dashboard 看板（三）— Chat 人机协作 + Admin / Settings"
+order: 3
+estimated_minutes: 15
+---
+
+# Dashboard 看板（三）— Chat 人机协作 + Admin / Settings
+
+> 多 Agent 系统真正难的不是“让 Agent 自己跑”，而是人在它们跑到一半时还能看懂、插话、纠偏和收口。
+
+## 0. 一句话先讲明白
+
+Dashboard 不是只读监控屏，而是人参与多 Agent 协作的控制台：Chat 面板让你直接对某个 Agent 发消息、追问或改方向；Admin 和 Settings 则给你审视用户、连接与配置状态的入口。
+
+本节只讲 Dashboard 里的“人如何介入”。RBAC 的安全边界和 network 角色已经在 CH4 L03 展开，这里不重复权限矩阵，也不假设 Admin / Settings 当前 UI 一定有哪些固定字段。
+
+## 你将学到
+
+- Chat 面板和普通 Messages / Tasks 面板的区别
+- 如何从 Dashboard 打开某个 Agent 的 Chat 页面
+- 人在 Agent 协作中途介入时，应该说什么、不该说什么
+- Chat 消息状态 `delivered` / `acked` / `running` / `replied` / `failed` / `cancelled` / `expired` 怎么读
+- Admin 面板在多人协作里的定位
+- Settings 面板在连接与配置排查里的定位
+- 为什么 Dashboard 是“控制台”，不是只读看板
+
+## 适合谁
+
+已经跑通本机 Hub、至少启动过一个节点，并看过 CH5 前两节 Overview / Tasks / Messages 的读者。你应该知道 `writer-a`、`reviewer-b` 这类 alias 是 Agent 的可读名字，也知道 Hub 是 Agent 之间通信的中心。
+
+## 1. 先把 Dashboard 打开
+
+Dashboard 是独立进程，默认监听本机：
+
+```bash
+anet hub dashboard
+```
+
+Dashboard 默认启动在 `127.0.0.1:3000`，并连接当前 anet 配置里的 CommHub；如果本机已经有 admin 登录态，它会自动进入页面，否则进入 UI 登录流程。
+
+如果你要显式指定 Hub：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet hub dashboard
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:3000
+```
+
+第一次进入时按当前页面提示完成登录。登录后，左侧导航里可以看到 Admin、Settings；Chat 不是左侧全局入口，而是从 Overview / Nodes 点击某个节点，或直接访问 `/node?alias=writer-a` 进入对应 Agent 的节点详情页。
+
+## 2. Chat 面板解决什么问题
+
+Tasks 面板回答的是：“这条任务现在跑到哪一步？”
+
+Messages 面板回答的是：“系统里发生过哪些原始消息？”
+
+Chat 面板回答的是：“我现在要不要直接对某个 Agent 说一句话？”
+
+这三者的差别很重要。Tasks 和 Messages 更偏审计与回放；Chat 是介入通道。比如 `writer-a` 正在写方案，`reviewer-b` 已经指出方向有偏差，你不需要等整条任务失败再重跑，可以直接进入 `writer-a` 的 Chat：
+
+```text
+请先停一下当前输出，把重点改成 Dashboard 里的人机协作介入，不要继续展开部署细节。
+```
+
+这句话会作为人类消息进入 Agent 的上下文。Agent 接到后可以调用 LLM 处理，并返回 markdown 格式的回复。你要记住的不是“点了哪个按钮”，而是：Chat 让人可以对某个 alias 精确发话。
+
+## 3. 打开某个 Agent 的 Chat
+
+Dashboard 的节点详情页使用 alias 定位 Agent。你可以从 Overview / Nodes 点击节点进入，也可以直接访问类似路径：
+
+```text
+http://127.0.0.1:3000/node?alias=writer-a
+```
+
+节点详情页的 Chat 输入框会按 alias 提示目标，例如：
+
+```text
+Message writer-a...
+```
+
+这说明 Chat 不是一个全局聊天室，而是“你正在和这个 alias 对应的 Agent 对话”。切到 `reviewer-b` 时，输入框会对应变成：
+
+```text
+Message reviewer-b...
+```
+
+发消息的基本动作很简单：
+
+1. 打开 `writer-a` 的节点页面。
+2. 确认当前是 Chat tab。
+3. 在 textarea 里输入消息。
+4. 按 Enter 发送。
+
+按 Enter 后会出现 outgoing bubble，也就是你刚发出的消息气泡。
+
+## 4. 读懂 Chat 消息状态
+
+Chat 消息不是“发出去就完了”。它背后仍然走 CommHub 的投递与 Agent 处理链路，所以 Dashboard 会给你状态标签。
+
+常见状态包括：
+
+| 状态 | 入门读法 |
+|---|---|
+| `created` | UI 已创建消息气泡，通常是很短暂的前端/记录状态 |
+| `delivered` | Hub 已写入并尝试把消息投递到目标 Agent |
+| `acked` | 目标 Agent 已确认收到 |
+| `running` | Agent 正在处理，通常意味着会调用模型或工具 |
+| `replied` | Agent 已返回回复 |
+| `failed` | 投递或处理失败，需要看节点状态与日志 |
+| `cancelled` | 人或流程取消了任务，回看取消时机和原因 |
+| `expired` | 长时间没有完成，重点查 alias、network、SSE 和目标节点是否在线 |
+
+你在 Chat 里看到状态变化时，不要把它当成装饰文本；它是在告诉你消息处于哪一段链路。Chat 气泡是人到 Agent 的投递/处理链路；Tasks 是任务状态机；Messages 是历史通信记录。不要把三者混成一个东西。
+
+排查时可以按这个顺序看：
+
+1. 一直停在 `created`：先看 Hub / Dashboard 连接。
+2. 到了 `delivered` 但没有 `acked`：先看目标 alias、network 和 SSE。
+3. 到了 `acked` 或长时间 `running`：看 Agent 是否在等待模型、工具或人工确认。
+4. 出现 `failed` / `cancelled` / `expired`：回到 Tasks / Messages / 节点日志交叉确认。
+
+## 5. 连续消息：像对话，但要有节奏
+
+Chat 支持连续发多条消息，页面会按顺序显示你发出的内容。
+
+这意味着你可以像和同事对话一样逐步补充上下文：
+
+```text
+先概括当前方案的问题。
+```
+
+```text
+再按 Dashboard 视角重写，不要写 CLI 自动化。
+```
+
+```text
+最后给我一个可以转给 reviewer-b 的检查重点。
+```
+
+但在多 Agent 协作里，连续消息不要乱发。建议遵守三个习惯：
+
+- 一条消息只改变一个方向，避免把“停下、重写、追加测试、通知别人”混成一大段。
+- 如果 Agent 已经 `running`，先等它回复或确认状态，再发第二条强指令。
+- 涉及多人协作时，明确点名上下文，例如“这是给 `writer-a` 的修正，不要求通知 `reviewer-b`”。
+
+Chat 能让人插手，但插手越频繁，越需要写得清楚。否则 Agent 不是没有执行，而是拿到了相互打架的指令。
+
+## 6. 介入正在跑偏的 Agent
+
+中途介入时，最重要的是把“你要它做什么”写成单一动作。下面这四类场景最常见。
+
+| 场景 | 什么时候用 | 可以这样说 |
+|---|---|---|
+| 纠偏 | Agent 展开了错误方向 | 停止继续扩展公网部署部分。当前任务只保留 Dashboard Chat、Admin、Settings 三块，重点改成人如何介入多 Agent 协作。 |
+| 补上下文 | Agent 缺少前置背景 | 补充背景：这节课的读者已经学过 CH4 L03 的 RBAC，所以这里不要重复权限矩阵，只讲从 Dashboard 怎么审视和介入。 |
+| 收口 | 内容已经发散，需要交付给下游 | 把当前结果压缩成 5 条检查点，准备交给 reviewer-b 复核。不要新增技术方案。 |
+| 暂停扩散 | Agent 开始继续派生新任务 | 先不要再给其他 Agent 派新任务。请只回复你已经完成了什么、还缺什么、下一步建议我确认哪一点。 |
+
+这些介入都不是“监控”。它们会改变协作过程本身，这就是 Dashboard 在多 Agent 系统里的核心价值。
+
+## 7. 确认谁能进入 Dashboard
+
+Admin 是用户管理入口。它的用户结果不是“看一个后台页面”，而是确认谁能进入这个控制台、谁可能影响当前 Hub。
+
+- 当前谁能进入 Dashboard
+- 多人协作时，哪些账号需要被审视
+- 演示、课程、项目环境是否还残留不该继续使用的账号
+- 登录与注册路径是否符合当前团队约定
+
+这里要保持边界：Admin 的具体字段以当前 UI 为准。本节不编造固定表单字段，也不把它写成完整权限矩阵。你真正要掌握的是工作习惯：
+
+1. 多人进入同一个 Hub 前，先在 Admin 看清楚用户入口。
+2. 协作结束后，再回到 Admin 审视是否需要清理或调整账号。
+3. 如果你要判断某个角色到底能做什么，回到 CH4 L03 的 RBAC 与 network 安全边界，不要只凭页面名称猜。
+
+还要区分两类 token：Dashboard 用户登录 token 让人进入控制台；Agent 节点用的是 network-scoped 节点 token，走 SSE 连到 Hub。不要因为一个人能登录 Dashboard，就推断某个节点 token 的权限边界也一样。节点 token 和 network 边界回到 CH4 L03 判断。
+
+Dashboard 的 Admin 面板让“谁在控制台里”变得可见。可见之后，团队才有讨论权限和责任边界的基础。
+
+## 8. 确认 Dashboard 连的是哪个 Hub
+
+Settings 是连接与配置管理入口。它的用户结果是：当页面看起来正常但节点、Chat、Tasks 都不对时，先确认 Dashboard 连的是不是你以为的那个 Hub。
+
+- Dashboard 当前连的是哪个 Hub
+- 本地 Dashboard 和 CommHub 的连接是否符合预期
+- 某些 UI 行为异常时，是否先从配置侧排查
+- 当前环境的配置是否和 CLI 里看到的一致
+
+同样要保持谨慎：Settings 的具体字段以当前 UI 为准。本节只把它当作“配置审视入口”，不假设某个版本一定有某个开关。
+
+当你怀疑 Dashboard 连错 Hub，可以在终端侧对照：
+
+```bash
+anet hub config
+```
+
+或启动时显式指定：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet hub dashboard
+```
+
+如果 Dashboard 页面打开了，但节点为空、Chat 发不通、状态长期不变化，不要只盯着浏览器。按顺序看三件事：
+
+1. Dashboard 连接的 Hub 是否正确。
+2. 目标 Agent 是否在线。
+3. Chat 消息状态停在哪个阶段。
+
+Settings 的价值不是“调一个神秘开关”，而是让你把 Dashboard、Hub、Agent 三者的连接关系摆到台面上。重点查三类漂移：Hub URL 漂移、Dashboard 登录 token 漂移、当前 network 漂移。
+
+## 9. Dashboard 是控制台，不是只读屏幕
+
+到这里，CH5 的三个视角可以合起来看：
+
+| 面板 | 主要问题 | 人的动作 |
+|---|---|---|
+| Overview / Nodes | 谁在线、谁在忙 | 找到要看的 Agent |
+| Tasks / Messages | 发生了什么、卡在哪里 | 追链路、查证据 |
+| Chat | 现在要不要介入 | 发消息、纠偏、收口 |
+| Admin | 谁能进入和管理 | 审视用户入口 |
+| Settings | 连到哪里、配置如何 | 审视连接与配置 |
+
+如果只把 Dashboard 当监控屏，你会停在“看见问题”。把它当控制台，你会继续做三件事：
+
+1. 找到相关 Agent。
+2. 看懂当前状态。
+3. 用 Chat 或管理入口让协作回到正轨。
+
+这也是多 Agent 协作和普通后台监控最大的差别：Dashboard 面对的不是一组静态服务，而是一组会读上下文、会调用模型、会互相派活的工作节点。人必须能在中途进入系统。
+
+## 总结
+
+本节讲了 Dashboard 的介入面：
+
+1. Chat 面板是人直接参与 Agent 协作的入口，不只是消息查看器。
+2. `/node?alias=writer-a` 默认进入对应 Agent 的 Chat tab，textarea 会显示 `Message writer-a...`。
+3. 按 Enter 发送后，消息会出现 outgoing bubble；常规链路看 `delivered`、`acked`、`running`、`replied`，终态还包括 `failed`、`cancelled`、`expired`。`created` 只按 UI 瞬时状态理解。
+4. 连续消息会按顺序出现，但多 Agent 场景里要控制节奏，避免指令互相打架。
+5. Admin 用来审视用户管理入口，Settings 用来审视连接和配置入口，具体字段以当前 UI 为准。
+6. Dashboard 的定位是“人参与多 Agent 的控制台”，不是只读监控。
+
+下一章会进入完整 case study：先用 CH4 的 project 把一组 Agent 拉起来，再用本章的 Overview / Nodes 核对上线，用 Tasks / Messages 追链路，用 Chat 介入纠偏，最后把这套操作循环放进真实项目里跑完。

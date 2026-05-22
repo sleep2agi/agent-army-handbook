@@ -1,0 +1,412 @@
+---
+title: "Dashboard 看板（一）— Overview 拓扑 + Nodes 节点管理"
+order: 1
+estimated_minutes: 15
+---
+
+# Dashboard 看板（一）— Overview 拓扑 + Nodes 节点管理
+
+> Dashboard 不是“打开看一眼绿灯”的摆设。多 Agent 跑起来以后，它是你每天判断团队是否健康、谁在线、谁卡住、哪里可能是假象的第一块仪表盘。
+
+## 0. 一句话先讲明白
+
+**Overview 看整体拓扑，Nodes 看节点清单和详情；但 Dashboard 显示的是 Hub 视角，不等于每个 Agent 进程的全部真相。**
+
+CH1 的 Dashboard 介绍只解决第一次打开：`anet hub dashboard`、访问 `http://127.0.0.1:3000`、看到节点在线。CH4 已经把 Hub 扩到多机，并用 `anet project up` 成组拉起节点；到了 CH5，第一件事就是用 Dashboard 核对这一组节点是否真的连到同一个 Hub、同一个 network，并且 alias 没有缺口。
+
+---
+
+## 你将学到
+
+- Overview 拓扑图应该按什么顺序读
+- Hub、Agent、network、SSE 连接在图上分别代表什么
+- Nodes 面板适合用来管理哪些节点信息
+- 点开节点详情时应该优先看哪些字段
+- 为什么 `online`、`idle`、`working`、`offline` 有时会滞后或误导
+- Dashboard 状态和 CLI 状态不一致时怎么判断谁更接近现场
+
+## 适合谁
+
+适合已经跑通 CH1、能启动 Hub 和至少一个 Agent 节点的读者。你应该已经知道：
+
+- `anet hub start` 启动 CommHub Server
+- `anet hub dashboard` 启动 Dashboard
+- `anet node start writer-a` 让节点上线
+- 看到 `SSE connected` 基本代表节点已经连上 Hub
+
+如果你还没打开过 Dashboard，先回 CH1 L04；本节默认你已经能进入页面。
+
+---
+
+## 1. 先把 Dashboard 当“Hub 视角”来理解
+
+Dashboard 看到的不是某台机器的进程表，也不是某个 LLM runtime 的内部状态。它主要展示的是 **CommHub Server 掌握的状态**：
+
+- 哪些节点曾经注册到这个 Hub
+- 哪些节点当前有 SSE 连接
+- 节点最后一次上报的任务状态
+- 节点所在的 network
+- 任务和消息有没有经过 Hub
+
+这点非常关键。很多误判都来自一句话：“Dashboard 显示它在线，所以它一定没问题。”
+
+不一定。
+
+Dashboard 显示在线，通常说明 Hub 认为这个 alias 的 SSE 通道存在，或者最近的状态记录还没有过期。但 Agent 真正能不能完成任务，还取决于更多东西：节点进程是否还活着、runtime 是否卡住、模型供应商是否可用、工具调用是否兼容、当前任务是否已经进入死等。
+
+所以本节的读法不是“看到绿色就放心”，而是：
+
+1. Overview 判断整体拓扑有没有明显缺口
+2. Nodes 找到具体节点
+3. 详情里看身份、network、状态和最近活动
+4. 有疑点时回到 CLI 或日志交叉验证
+
+---
+
+## 2. Overview 拓扑图：先看“少了谁”
+
+Overview 的价值不是精确诊断每个任务，而是让你在几秒内回答三个问题：
+
+- 这个 Hub 上现在有哪些 Agent？
+- 哪些 Agent 看起来在线？
+- 哪些 Agent 之间正在围绕同一个 Hub 协作？
+
+你可以把它当作“作战地图”，但别把它当数据库查询器。拓扑图适合发现大问题：节点没连上、某个 network 里明显少了一组角色、Hub 重启后节点还没回来。
+
+### 2.1 中心不是老板，是路由器
+
+在 anet 里，CommHub 是中心节点。它不是“总 Agent”，也不替其他 Agent 思考；它负责路由、状态记录、任务投递和消息持久化。
+
+Agent 之间不是互相直连。即使两个 Agent 看起来在协作，底层也是：
+
+```text
+writer-a -> CommHub -> reviewer-a
+```
+
+这就是为什么 Overview 的图通常是 Hub 居中，节点围绕 Hub 展开。你读图时先不要急着看连线漂不漂亮，先看“应该出现的节点有没有出现”。
+
+### 2.2 拓扑图的第一眼检查顺序
+
+日常打开 Overview，建议按这个顺序扫：
+
+1. **Total 数量**：总节点数是否符合预期。比如你这个项目应该有 4 个角色，图上只有 3 个，就先别看任务，先找缺的那个。
+2. **Online 数量**：在线节点是否够支撑当前工作流。只有一个写作节点在线，reviewer 全不在线，任务当然会卡在投递后。
+3. **节点 alias**：名字是否是你要找的那批节点。多项目共用一个 Hub 时，最常见的错觉是“我看到节点了”，但看到的是另一个项目的旧节点。
+4. **状态分布**：有没有一批节点同时 offline，或者某个节点长时间 working。
+5. **最近活动**：如果页面提供最近状态或详情入口，点进去看最近任务和上报时间；不要只看颜色。
+
+Nodes 页面会把节点总览、在线统计和节点清单放到同一个入口里。你在这里不需要猜测“应该有几个 Agent”：把 CH4 `anet project up` 计划拉起的角色清单放在旁边，一个个对 alias、online、network。
+
+### 2.3 图上的连线只代表“经过 Hub”
+
+不要把 Overview 的连线理解成长期稳定的团队结构。
+
+在 anet 里，Agent 通过 MCP 工具自由派活。今天 `writer-a` 给 `reviewer-a` 派任务，明天它也可以给 `judge-a` 派任务。拓扑图展示的是 Hub 视角下的连接和活动关系，不是固定 DAG，也不是项目架构图。
+
+因此，Overview 更适合回答：
+
+- 谁连上了这个 Hub？
+- 哪些节点最近有活动？
+- 哪些节点可能掉线？
+
+它不适合单独回答：
+
+- 这条任务为什么失败？
+- 某个子任务被谁转派了？
+- 某条消息内容是什么？
+
+后面这些问题要去 Tasks 和 Messages 面板，本章 L02 会拆。
+
+---
+
+## 3. Nodes 面板：从“看见节点”到“管理节点清单”
+
+Overview 是地图，Nodes 是清单。
+
+当节点少的时候，拓扑图够用；当你有十几个 Agent，或者同一个 Hub 上挂着多个项目，Nodes 面板才是日常入口。它适合做三件事：
+
+- 盘点：现在这个 Hub 里注册了哪些节点
+- 分组：这些节点属于哪个 network 或项目语境
+- 定位：某个 alias 的状态、详情、最近活动是否正常
+
+这里说的“管理”，主要是运行期管理：识别、筛选、定位和核对。不要把它默认理解成“Dashboard 一定能远程启动或停止节点进程”。可靠的节点生命周期操作仍然以 CLI 为准，比如：
+
+```bash
+anet node start writer-a
+anet node ls
+anet logs writer-a
+```
+
+如果你在某个版本的 Dashboard 里看到节点操作控件，也建议操作后用 `anet node ls` 或日志确认结果。Dashboard 是 Hub 的管理入口，不是万能的远程进程管理器。
+
+### 3.1 Nodes 里优先看 alias
+
+alias 是 Agent 在网络里的名字，也是派任务时最容易写错的字段。
+
+比如你在 Chat 或 Agent 指令里让节点发给 `writer-a`，Hub 匹配的就是这个名字。如果 Nodes 里实际叫 `writer_a`、`writer-a-1` 或者挂在另一个 network 下，任务就可能投到你没想到的地方，或者安静地等到过期。
+
+日常建议：
+
+- 角色名稳定：`writer-a`、`reviewer-a`、`judge-a` 这类名字比随机代号更适合协作
+- 同一项目统一前缀或 network，不要把临时实验节点混进生产项目
+- 在派任务前先在 Nodes 确认目标 alias 存在且在线
+
+### 3.2 再看 Online，不要只看 Status
+
+节点状态通常会有两个层次：
+
+- **连接层**：SSE 是否连着，Hub 能不能把任务推给它
+- **任务层**：节点自己上报的是 idle、working 还是 offline
+
+连接层更像“电话线通不通”，任务层更像“对方说自己在忙什么”。两者都重要，但含义不同。
+
+一个常见误判是：`STATUS=idle`，所以节点一定能接任务。实际可能是 SSE 已经断了，只是状态字段还没及时更新。反过来，也可能 `SSE=●` 但 `STATUS=offline`，说明连接回来了，状态记录还没刷新到你期待的值。
+
+所以 Nodes 面板里如果同时能看到在线统计和状态字段，优先按这个逻辑判断：
+
+| 现象 | 更合理的判断 |
+|---|---|
+| Online 正常，状态 idle | 大概率可接任务 |
+| Online 正常，状态 working 很久 | 可能在处理长任务，也可能 runtime 卡住 |
+| Online 异常，状态 idle | 先怀疑状态滞后 |
+| Online 异常，状态 working | 任务可能已经失去执行者，去 Tasks 查状态 |
+| 节点不在列表里 | 先确认节点是否注册到当前 Hub / 当前 network |
+
+### 3.3 最后看 network
+
+多机部署、多用户、多个项目共用 Hub 以后，network 会变得很重要。
+
+同名或近似同名节点出现在不同 network 时，你在 Dashboard 上看到“有一个 writer-a 在线”，并不代表当前任务能派给它。权限、可见性、任务路由都可能受 network 影响。
+
+日常观测时，把 network 当作第二身份：
+
+```text
+alias:   writer-a
+network: agent-network
+```
+
+只有 alias 和 network 都对，才算你找到了正确节点。
+
+---
+
+## 4. 节点详情：不要只点开看名字
+
+Dashboard Chat 里可以点 node，Overview 或 Nodes 里通常也会提供节点详情入口。点开详情不是为了满足好奇心，而是为了把“一个圆点”还原成可以排查的对象。
+
+建议按下面顺序读详情。
+
+### 4.1 身份信息
+
+先确认它是不是你要看的节点：
+
+- alias 是否匹配
+- network 是否匹配
+- runtime 或节点类型是否符合预期
+- 当前 Hub 地址是否是 `HUB_URL` 指向的那个 Hub
+
+如果身份不对，后面的状态全都没有意义。多项目环境里，“看错节点”比“节点真的坏了”更常见。
+
+### 4.2 连接信息
+
+再看它是否真连着 Hub。
+
+anet 的关键通道是 SSE。Agent 启动后会连到 Hub 的事件通道，Hub 才能主动把任务推给它。CH1 里你第一次看到的 `SSE connected`，在日常排查中仍然是核心信号。
+
+如果 Dashboard 显示在线，但任务一直不动，用 CLI 对照：
+
+```bash
+anet node ls
+```
+
+重点看目标节点对应的 SSE 列。如果 CLI 也显示断开，Dashboard 上的旧状态就不要信。
+
+### 4.3 最近活动
+
+最后看最近任务、最近消息或最近更新时间。这里的目的不是完整追任务链路，而是判断节点有没有“新鲜活动”。
+
+比如：
+
+- 刚刚通过 Chat 发了 handshake，Tasks 或 Messages 里应该能看到相关记录
+- 节点声称 working，但最近很久没有新消息，可能是长任务，也可能卡住
+- 节点 online，但没有任何最近活动，可能只是空闲，也可能你派错了目标 alias
+
+更完整的任务链路排查放到本章 L02。这里先记住一句：**节点详情看的是“这个节点是否像活着”，不是“这条任务为什么失败”。**
+
+---
+
+## 5. 判断在线状态是否可信
+
+Dashboard 最容易骗你的地方，不是 UI 错了，而是你把“状态记录”误读成“实时真相”。
+
+下面几类情况最常见。
+
+### 5.1 上报会慢半拍
+
+Agent 会向 Hub 上报状态，但上报不是强一致事务。网络抖动、Hub 重启、Agent 正在忙、runtime 卡住，都可能让状态慢半拍。
+
+结果就是：
+
+- Agent 已经恢复连接，Dashboard 还显示旧状态
+- Agent 已经退出，Dashboard 还短暂显示 idle
+- Agent 正在跑任务，但状态还没切到 working
+- 任务已经结束，但状态还停在 working
+
+这不是你要立刻重装环境的信号。先等一个刷新周期，再用 CLI 和日志确认。
+
+### 5.2 SSE 在线不等于 LLM 可用
+
+SSE 只证明 Hub 到 Agent 的推送通道通了。它不证明：
+
+- 模型 API key 可用
+- Provider 没有限流
+- runtime 没有卡死
+- 工具调用兼容
+- 当前工作目录权限正确
+
+所以一个节点可以“在线但不能干活”。这类问题在 Dashboard 里通常表现为：节点在线，任务进入后长时间没有有效回复。
+
+排查顺序：
+
+```bash
+anet node ls
+anet logs writer-a
+```
+
+先确认连接，再看节点日志里是否有 runtime、provider、tool_use 或权限错误。
+
+### 5.3 长时间 working 先看链路
+
+多 Agent 任务里，长时间 working 有三种可能：
+
+- 任务本来就重，比如读大量文件、跑测试、生成长文
+- Agent 正在等子任务结果
+- runtime 或工具调用卡住
+
+Dashboard 上只看到 working，不能直接判断是哪一种。你要结合任务链路：
+
+- Tasks 里是否有子任务
+- Messages 里是否有持续输出或 handshake
+- 节点日志是否还在滚动
+
+如果日志没有新输出，Tasks 也没有进展，再考虑重启节点或取消任务。
+
+### 5.4 短暂 offline 先观察重连
+
+短暂 offline 可能来自：
+
+- 你本地重启了节点
+- 网络断了一下
+- Hub 重启后 Agent 正在重连
+- Dashboard 自己的浏览器连接刚恢复
+
+如果一个节点在 Overview 上瞬间掉线又回来，先别急着处理。真正需要处理的是稳定掉线：几分钟都不回来，`anet node ls` 也显示 SSE 断开，日志没有重连成功。
+
+---
+
+## 6. 用 Dashboard 核对 project 是否完整上线
+
+下面是一套我建议固定下来的 Dashboard 巡检流程。它特别适合接在 CH4 L04 后面：你刚用 `anet project up` 拉起整组节点，不要马上派复杂任务，先核对这组 Agent 是否完整上线。
+
+### 6.1 先打开 Dashboard
+
+```bash
+anet hub dashboard
+```
+
+浏览器访问：
+
+```text
+http://127.0.0.1:3000
+```
+
+如果你在多机环境里用统一 Hub，可以让 Agent 侧通过环境变量指向 Hub：
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+anet hub dashboard
+```
+
+这里用 `127.0.0.1` 只是本机示例。局域网和公网部署在 CH4 已经讲过，生产环境不要把管理端口随便暴露出去。
+
+### 6.2 Overview 三问
+
+进入 Overview，先问三句：
+
+1. 我期望的节点数量对吗？
+2. 关键角色都在线吗？
+3. 有没有节点长时间处在异常状态？
+
+如果三问都正常，再开始派活。如果第一问就不正常，不要继续往下跑复杂任务，先把节点补齐。
+
+### 6.3 Nodes 精确定位
+
+进入 Nodes，找到目标节点：
+
+- alias 是不是 `writer-a`
+- network 是不是当前项目
+- Online / Total 统计是否符合预期
+- 状态是否和你刚才的操作一致
+
+如果你刚启动节点，Dashboard 还没变化，给它一点时间，然后用：
+
+```bash
+anet node ls
+```
+
+做一次对照。
+
+### 6.4 点开详情看“新鲜度”
+
+点开节点详情后，不要只确认名字。看最近活动是否符合刚刚发生的事情。
+
+比如你刚从 Chat 对某个节点发了一个简单 handshake，那么 Tasks 或 Messages 应该能看到对应记录。它的意义是：不只节点在线，消息链路也真的走过 Hub。
+
+如果在线状态正常，但 handshake 没有进 Tasks 或 Messages，问题就不在“图上有没有这个点”，而在消息投递或任务链路。下一节会专门处理。
+
+---
+
+## 7. Dashboard 和 CLI 不一致时怎么判
+
+实际使用中你一定会遇到这种情况：
+
+- Dashboard 显示 online，CLI 显示 SSE 断开
+- Dashboard 显示 working，日志里已经结束
+- Nodes 里有节点，Overview 一时没画出来
+- 刚重启 Hub 后，页面统计还没更新
+
+不要争谁“权威”，先按层次判断。
+
+### 7.1 进程是否存在，看本机
+
+Dashboard 不能替你证明某台机器上的进程一定还活着。节点进程是否存在，最直接还是在节点所在机器看 CLI、tmux、进程管理器或日志。
+
+```bash
+anet logs writer-a
+```
+
+日志里如果已经没有重连、心跳或任务输出，Dashboard 的在线状态就只能当线索，不能当结论。
+
+### 7.2 Hub 是否认为它在线，看 SSE
+
+Hub 能不能推任务，关键看 SSE。CLI 的 `anet node ls` 通常比你盯着页面颜色更直接：
+
+```bash
+anet node ls
+```
+
+如果目标节点 SSE 断开，先修连接。不要先怀疑模型、prompt、provider。
+
+### 7.3 任务是否真的投递，看 Tasks/Messages
+
+节点在线不代表任务一定到达。任务是否创建、是否进入 inbox、是否被回复，要看 Tasks 和 Messages。
+
+这就是 CH5 拆成三节的原因：Overview 和 Nodes 解决“团队和节点是否健康”，Tasks 和 Messages 解决“某条任务和消息走到哪了”。
+
+---
+
+## 总结
+
+Overview 和 Nodes 是 Dashboard 的第一层：前者看全局拓扑，后者看节点清单和详情。日常使用时，先用 Overview 找明显缺口，再用 Nodes 锁定具体节点，最后用 CLI、日志、Tasks/Messages 交叉验证。
+
+最重要的判断原则是：**Dashboard 展示的是 Hub 视角的状态记录，不是每个 Agent 进程的绝对实时真相。** `online`、`idle`、`working` 都可能因为心跳、SSE、runtime 或网络问题滞后。真正稳的排查路径是：看拓扑、查节点、核 SSE、读日志、再追任务链路。
