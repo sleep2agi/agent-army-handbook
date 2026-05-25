@@ -1,0 +1,378 @@
+---
+title: "4 个内置 Demo 深挖 — debate / socialmedia / pr-review / sci-team 当模板"
+order: 2
+estimated_minutes: 18
+---
+
+# 4 个内置 Demo 深挖 — debate / socialmedia / pr-review / sci-team 当模板
+
+> 内置 demo 的价值不是“跑给别人看一下很酷”，而是把常见多 Agent 编排模式做成可拆的样板：回合制、内容流水线、并行审查、大规模 scaffold。
+
+## 0. 一句话先讲明白
+
+`anet demo` 里有 4 个重点 demo：`debate`、`socialmedia`、`pr-review`、`sci-team`。你不需要把它们当成固定玩法，而应该把它们当成四种模板：辩论适合回合制讨论，社媒适合线性内容生产，PR 审查适合并行 fan-out + judge 合并，科研军团适合批量创建多节点 scaffold。
+
+本节命令口径按 2026-05-22 本地 `anet demo ls` 与 `anet demo <name> --help` 核查。工具版本和 demo 细节以后可能变化，实际使用以你本机命令输出为准。
+
+## 你将学到
+
+- 4 个 demo 各自解决什么场景
+- 每个 demo 的角色数、耗时和输出是什么
+- 怎么从 demo 里抽出自己的项目模板
+- `sci-team` 的 5-50 人规模和 Phase 1 scaffold 边界
+- 什么时候保留 demo 现场，什么时候自动清理
+- 如何避免把 demo 误当成生产系统
+
+## 适合谁
+
+已经跑过至少一个 anet 节点，知道 Hub、network、alias、Dashboard 的读者。如果你刚完成上一节 PR 审查室项目，本节会帮你把那个项目和内置 demo 对上号。
+
+## 1. 先看 demo 列表
+
+运行：
+
+```bash
+anet demo ls
+```
+
+当前可见的 4 个重点 demo 是：
+
+| demo | 场景 | 角色 / 规模 | 典型耗时 |
+|---|---|---|---|
+| `debate` | 多 Agent 辩论赛 | 6 agent：主持人、正反 4 辩、评委 | 约 10 分钟 |
+| `socialmedia` | 社交媒体内容工厂 | 4 agent：选题、文案、配图、审核 | 约 3 分钟 |
+| `pr-review` | 代码 PR 审查室 | 4 agent：安全、性能、风格 3 reviewer 并行 + judge | 约 2 分钟 |
+| `sci-team` | 科研军团 scaffold | 1 leader + N-1 worker，默认 10，5-50 可调 | 以规模和模型响应为准 |
+
+这四个 demo 覆盖的是四种不同编排，不是四个孤立命令。真正要学的是它们背后的结构。
+
+## 2. debate：回合制讨论模板
+
+`debate` 适合“多个角色围绕一个议题轮流发言，最后由评委收口”的任务。它默认创建独立 network，跑完自动清理；加 `--keep` 可以保留现场用于调试。
+
+最小命令：
+
+```bash
+TOPIC="AI 创造的岗位是否比消灭的多"
+anet demo debate --topic "$TOPIC"
+```
+
+如果你要保留 agent 和 network：
+
+```bash
+TOPIC="AI 内容标识是否应该成为平台默认能力"
+anet demo debate --topic "$TOPIC" --keep
+```
+
+如果你要指定输出文件：
+
+```bash
+TOPIC="小团队是否应该先搭多 Agent 工作流"
+anet demo debate --topic "$TOPIC" --out ./debate-result.md
+```
+
+`debate` 的核心不是“辩论”这个题材，而是回合制：
+
+1. 主持人开场，明确议题。
+2. 正反方按顺序发言。
+3. 评委读取前面上下文，输出裁决或总结。
+4. CLI 把实录写成 markdown。
+
+把它改成你的项目时，可以这样替换：
+
+| debate 角色 | 可改造成 |
+|---|---|
+| 主持人 | 会议 facilitator、需求澄清者、评审主持 |
+| 正方 | 方案 A 支持者、业务视角、速度优先视角 |
+| 反方 | 方案 B 支持者、风险视角、质量优先视角 |
+| 评委 | 决策记录人、架构评审人、总结人 |
+
+适合改造的场景：
+
+- 技术方案 A/B 评审
+- 产品需求是否进入本周开发
+- 内容选题是否值得做
+- 运营活动是否应该上线
+
+不适合的场景：
+
+- 需要直接执行工具链的任务
+- 需要大量文件读写的任务
+- 需要严格并行处理的任务
+
+回合制的好处是可读性强，坏处是时间更长。你选择它，是因为你需要多轮观点碰撞，而不是因为它看起来像会议。
+
+## 3. socialmedia：内容流水线模板
+
+`socialmedia` 是 4-agent 内容工厂：选题、文案、配图、审核。它适合“一条内容从想法到可发布草稿”的线性流程。
+
+最小命令：
+
+```bash
+TOPIC="面向非程序员的多 Agent 入门"
+anet demo socialmedia --topic "$TOPIC" --platform xiaohongshu
+```
+
+换平台：
+
+```bash
+TOPIC="Dashboard 如何帮你看懂 Agent 卡点"
+anet demo socialmedia --topic "$TOPIC" --platform wechat
+```
+
+命令帮助里可见平台包括 `xiaohongshu`、`twitter`、`wechat`、`linkedin`。不同平台不是换一个名字而已，而是内容长度、语气、结构和审核重点不同。
+
+它的角色链路可以抽象成：
+
+```text
+选题 -> 文案 -> 配图 -> 审核
+```
+
+改造成你自己的项目时，可以把这条链换成任何“先生成，再检查”的流程：
+
+| 原 demo | 内容团队改造 | 教研团队改造 | 软件团队改造 |
+|---|---|---|---|
+| 选题 | 选题官 | 课节目标设计 | issue triage |
+| 文案 | 正文 writer | 教案 writer | patch planner |
+| 配图 | 视觉 prompt | 练习设计 | 测试用例设计 |
+| 审核 | 合规 / 平台审核 | 教学质量审核 | code reviewer |
+
+这个 demo 的关键不是“社媒”，而是流水线交接。每个角色只接上一环输出，再把结果交给下一环。它适合步骤明确、顺序稳定的工作。
+
+使用时注意两点：
+
+1. 审核角色必须有否决权，否则它只是装饰。
+2. 前面角色的输出要足够结构化，否则后面角色会把时间花在猜意图上。
+
+如果你要把它改成课程生产线，最小版本可以是：
+
+```text
+lesson-planner -> tutorial-writer -> examples-editor -> quality-reviewer
+```
+
+这比让一个 Agent 从头写到尾更稳，因为每个角色的职责更窄，问题也更容易定位。
+
+## 4. pr-review：并行 fan-out + judge 模板
+
+`pr-review` 是最接近工程日常的 demo。它把同一份 diff 同时发给安全、性能、风格三个 reviewer，再由 judge 合并。
+
+三种入口任选一种：
+
+```bash
+anet demo pr-review --diff ./my-pr.diff
+```
+
+```bash
+anet demo pr-review --ref origin/main
+```
+
+```bash
+PR_URL="https://github.com/owner/repo/pull/N"
+anet demo pr-review --pr "$PR_URL"
+```
+
+`--pr` 入口需要本地安装并登录 `gh` CLI；`--diff` 和 `--ref` 更适合第一轮本地验证。
+
+这个 demo 的结构是：
+
+```text
+同一份输入
+  -> reviewer-security
+  -> reviewer-performance
+  -> reviewer-style
+三份结果
+  -> judge
+最终 markdown
+```
+
+它适合所有“多个视角独立看同一份材料，最后合并”的任务：
+
+| 任务 | 并行 reviewer | judge |
+|---|---|---|
+| PR 审查 | 安全、性能、风格 | 终审 reviewer |
+| 课程审核 | 技术、运营、商业、表达 | 主编 |
+| 合同初审 | 风险、交付、财务 | 法务负责人 |
+| 产品方案评审 | 用户、增长、工程 | 产品 owner |
+
+fan-out + judge 的优势，是速度和视角分离。三个 reviewer 不需要彼此等待；judge 只在最后做去重和决策。
+
+但它也有一个风险：如果 judge 的标准不清，三份结果会被随意揉在一起。所以你改造时要先写 judge 规则：
+
+```text
+只把会影响安全、数据、构建、测试或明确用户行为的问题判为 Request Changes。
+低优先级可读性建议放入 Comment。
+如果 reviewer 意见冲突，必须写出采用哪个判断以及原因。
+```
+
+上一节完整项目其实就是把这个 demo 的思想拆开，手工走了一遍。等你理解后，再用内置 demo 或自己的脚本提高速度。
+
+## 5. sci-team：大规模 scaffold 模板
+
+`sci-team` 和前三个 demo 不一样。它不是一个完整研究产品，而是 Phase 1 scaffold：批量创建 N 个研究 agent，默认 10 个，合法范围 5-50。
+
+最小命令会进入向导：
+
+```bash
+anet demo sci-team
+```
+
+显式指定规模和目录：
+
+```bash
+COUNT=10
+WORKDIR="$HOME/agent-workspaces/sci-team"
+read -rsp INTERN_API_KEY
+printf '\n'
+
+anet demo sci-team --count "$COUNT" --dir "$WORKDIR" --intern-api "$INTERN_API_KEY"
+```
+
+如果人数超出范围，CLI 会钳到 5-50 的合法区间。它的模型侧口径是 Intern 兼容的 Anthropic-style API：runtime 为 `claude-agent-sdk`，model 为 `intern-s1-pro`，base URL 为 `https://chat.intern-ai.org.cn`。这些值是 demo preset，不代表你所有项目都必须这么配。
+
+`sci-team` 当前要按 scaffold 理解：
+
+- 批量创建工作目录和节点配置。
+- 每个节点独立 cwd。
+- 写入 Intern preset 和 placeholder system prompt。
+- 通过 tmux 拉起节点。
+- leader 智能 fan-out、科研子方向自动分配、最终综述聚合属于后续阶段，不要把它写成已经成熟的自动科研流水线。
+
+生命周期命令建议用通用 batch 入口：
+
+```bash
+anet batch stop sci-team
+```
+
+```bash
+anet batch cleanup sci-team --workdir "$WORKDIR"
+```
+
+`anet demo sci-team --stop`、`--restart`、`--cleanup` 仍可见，但命令帮助和源码里已经提示新用户使用 `anet batch <verb> sci-team` 作为更通用的生命周期方式。
+
+适合改造 `sci-team` 的场景：
+
+- 需要一次性创建很多相似角色。
+- 每个 worker 有独立工作目录。
+- 你先要搭建节点队列，再逐步补智能分工。
+
+不适合的场景：
+
+- 你只需要 3-4 个高质量角色。
+- 你还没有清楚的任务分解方式。
+- 你期待它自动产出严肃研究结论并直接发布。
+
+规模越大，越需要控制成本、日志、失败重试和清理策略。默认 10 个是入门演示，不是越多越好。
+
+## 6. `--keep` 和清理策略
+
+前三个 one-shot demo 通常会创建临时 agent 和独立 network，跑完自动清理。这个默认行为适合普通体验，因为不会留下太多节点。
+
+当你要学习或调试时，加 `--keep`：
+
+```bash
+TOPIC="多 Agent 是否适合小团队"
+anet demo debate --topic "$TOPIC" --keep
+```
+
+保留现场后，你可以打开 Dashboard 看：
+
+- demo 创建了哪些 alias
+- topology 是否符合预期
+- Tasks 是否按顺序或并行推进
+- Messages 里每个 Agent 收到的 prompt 是什么
+- 出错时停在哪个状态
+
+保留现场也意味着你要负责清理。清理前先确认没有真实工作还在跑，然后按 demo 输出提示或通用 project / batch 命令处理。
+
+## 7. 从 demo 改成项目的四步
+
+把 demo 改成自己的项目，不是复制命令改个 topic。建议按四步做。
+
+第一步：抽编排结构。
+
+```text
+debate       -> round-based discussion
+socialmedia  -> linear pipeline
+pr-review    -> parallel fan-out + judge merge
+sci-team     -> batch scaffold
+```
+
+第二步：替换角色。
+
+不要保留“主持人、选题官、评委”这些表面名字，而是替换成你项目里的真实职责：
+
+```text
+planner -> writer -> reviewer -> operator
+```
+
+或者：
+
+```text
+risk-reviewer / growth-reviewer / ops-reviewer -> decision-owner
+```
+
+第三步：统一接口。
+
+每个角色都要有固定输入和输出格式。例如：
+
+```markdown
+## Input understood
+
+## Findings
+
+## Decision
+
+## Next action
+```
+
+第四步：决定自动化边界。
+
+先问三个问题：
+
+1. Agent 能不能只读，不直接写生产环境？
+2. 失败时人能不能从 Dashboard 看懂卡点？
+3. 输出能不能被人工验收后再发布？
+
+这三个问题如果答不上来，就先不要追求全自动。
+
+## 8. 不同 demo 怎么选
+
+可以用这张表快速判断：
+
+| 你的任务 | 优先模板 | 原因 |
+|---|---|---|
+| 多方观点讨论、方案评审 | `debate` | 回合制，过程可读 |
+| 内容从想法到草稿 | `socialmedia` | 线性流水线，交接清楚 |
+| 多视角审同一份材料 | `pr-review` | 并行审查，judge 合并 |
+| 一次性创建很多相似节点 | `sci-team` | 批量 scaffold，规模可调 |
+
+如果你的项目同时像两个 demo，先选更容易验收的那个。例如“课程审核”既像 `socialmedia`，也像 `pr-review`。如果你已经有草稿，只需要多维审核，就用 `pr-review` 模式；如果你从选题到正文都要生成，就用 `socialmedia` 模式。
+
+## 9. 常见误用
+
+第一种误用：把 demo 当生产系统。
+
+demo 是模板，不是完整业务系统。尤其是 `sci-team`，当前要按 scaffold 理解，不要承诺它已经自动完成严肃科研分工和综述聚合。
+
+第二种误用：只改 topic，不改验收。
+
+topic 改了，但角色输出、judge 标准、失败处理都没改，这只是换皮。真正的改造要改接口和验收标准。
+
+第三种误用：保留 demo 现场却忘记清理。
+
+`--keep` 适合学习和排错，不适合长期积累临时节点。保留之后要把清理写进 runbook。
+
+第四种误用：把 secret 放进命令历史。
+
+API key 尽量用环境变量或交互读取，不要写进文档、issue、截图和 shell 历史。课程示例使用变量名，不展示真实 key。
+
+## 总结
+
+本节把 4 个内置 demo 拆成了 4 种模板：
+
+1. `debate` 是回合制讨论模板，适合方案争论和决策记录。
+2. `socialmedia` 是线性内容流水线模板，适合“生成 -> 审核”的生产过程。
+3. `pr-review` 是并行 fan-out + judge 合并模板，适合多视角审核同一份材料。
+4. `sci-team` 是批量 scaffold 模板，默认 10 人、5-50 可调；当前要按 Phase 1 scaffold 理解，不要夸大成完整科研系统。
+
+到这里，ai-agent-army 的主线就闭合了：你已经从本机 Hub、单节点通信、runtime 和 provider、跨机器部署、Dashboard 控制台，走到了完整项目和 demo 改造。接下来真正要做的，是选一个低风险、可验收的工作流，把它做成你自己的第一支 Agent 小队。

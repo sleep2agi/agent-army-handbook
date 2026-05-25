@@ -1,0 +1,401 @@
+---
+title: "完整实战 — 从 0 搭一个多 Agent 项目并跑通上线"
+order: 1
+estimated_minutes: 22
+---
+
+# 完整实战 — 从 0 搭一个多 Agent 项目并跑通上线
+
+> 多 Agent 项目不是把一群 Agent 启动起来就结束。真正的交付，是选一个适合拆分的任务，定义角色和验收标准，跑起来，遇到卡点能定位，最后把产物交到一个可上线的位置。
+
+## 0. 一句话先讲明白
+
+这一节用一个“PR 审查室”的完整项目走完从 0 到上线：我们把一次代码变更拆给安全、性能、可读性三个 reviewer 并行审查，再由 judge 汇总成一份可以贴到 PR 的 review 结论。你会看到选型、建项目、起节点、派任务、看 Dashboard、排查卡点和收口上线的完整链路。
+
+这里的“上线”不是虚构一个产品收入，也不是承诺某个团队已经在生产环境使用；它指的是：项目目录、节点配置、运行方式、输出文件和人工验收标准都已经稳定到可以交给真实工作流使用。
+
+## 你将学到
+
+- 怎么判断一个任务适不适合多 Agent
+- 怎么把项目拆成角色、输入、输出和验收标准
+- 怎么用 `anet project` 拉起一组本地节点
+- 怎么通过 Dashboard 追踪节点、任务和消息
+- 跑偏、超时、无回复时怎么排查
+- 怎么记录架构取舍，让项目能被复用和交接
+
+## 适合谁
+
+已经学完 CH1 到 CH5 的读者。你应该能启动 Hub，知道 `network`、`alias`、节点 token、Dashboard、Tasks / Messages / Chat 分别是什么，也知道 `.anet/` 里会保存本地节点配置，不能提交到公开仓库。
+
+## 1. 先选一个适合多 Agent 的项目
+
+多 Agent 不是“越复杂越值得用”。一个适合落地的项目，至少满足四个条件：
+
+| 条件 | 入门判断 |
+|---|---|
+| 可拆分 | 任务天然有不同视角，不需要所有人抢同一段上下文 |
+| 可并行 | 多个角色能同时工作，最后再合并 |
+| 可验收 | 输出能被人检查，而不是只听 Agent 自夸 |
+| 低风险 | 出错时不会直接改线上数据、发真实消息或泄露凭据 |
+
+PR 审查室符合这四点：
+
+- 安全、性能、可读性是不同视角。
+- 三个 reviewer 可以同时读同一份 diff。
+- 最终输出是一份 markdown review，人可以逐条确认。
+- 第一次跑只读 diff，不自动合并代码，也不自动发布评论。
+
+反过来，如果任务是“让 Agent 自己决定要不要改生产数据库”，就不适合作为第一批项目。多 Agent 的第一条线应该先做“辅助判断和产物生成”，再逐步接近高权限动作。
+
+## 2. 写下项目边界
+
+先新建一个工作目录：
+
+```bash
+mkdir -p "$HOME/agent-workspaces/pr-review-room"
+cd "$HOME/agent-workspaces/pr-review-room"
+```
+
+把敏感配置从一开始就排除出 Git：
+
+```bash
+cat > .gitignore <<'EOF'
+.anet/
+.env
+*.log
+review-output/
+EOF
+```
+
+项目边界写在 `README.md` 里。这里不是写给外人看的宣传文案，而是给你和后续接手的人看的操作契约：
+
+```markdown
+# PR Review Room
+
+目标：把一次代码变更拆给 3 个 reviewer 并行审查，再由 judge 汇总成一份 markdown review。
+
+输入：
+- 本地 diff 文件，或当前分支相对基准分支的 git diff。
+
+输出：
+- `review-output/final-review.md`
+
+角色：
+- reviewer-security：看凭据泄露、权限绕过、注入、危险 IO。
+- reviewer-performance：看重复计算、阻塞 IO、大对象、无谓网络请求。
+- reviewer-style：看命名、抽象、可读性、死代码。
+- judge：合并三份意见，去重，给出 LGTM / Comment / Request Changes。
+
+不做：
+- 不自动合并代码。
+- 不自动发布 GitHub 评论。
+- 不读取生产密钥。
+```
+
+这一步很重要。多 Agent 项目最怕的是“每个 Agent 都很努力，但项目没有边界”。边界不清，后面 Dashboard 里看到再多消息，也很难判断它们是在推进还是发散。
+
+## 3. 定义角色和交接格式
+
+角色不要只写名字，要写清楚输入、动作、输出。
+
+| alias | 输入 | 动作 | 输出 |
+|---|---|---|---|
+| `reviewer-security` | diff + 审查标准 | 找安全风险，按严重度排序 | 安全问题列表 |
+| `reviewer-performance` | diff + 审查标准 | 找性能和资源问题 | 性能问题列表 |
+| `reviewer-style` | diff + 审查标准 | 找可维护性问题 | 风格问题列表 |
+| `judge` | 三份 reviewer 输出 | 去重、合并、判定 | 最终 review markdown |
+
+每个 reviewer 的输出最好统一成同一个格式：
+
+```markdown
+## Findings
+
+- Severity: high | medium | low
+- File:
+- Evidence:
+- Why it matters:
+- Suggested fix:
+
+## If no issues
+
+No blocking issue found in this area.
+```
+
+统一格式的好处，是 judge 不用猜每个 reviewer 在说什么。多 Agent 协作里，角色之间的“接口”比角色名字更重要。
+
+## 4. 初始化 Hub 和 network
+
+本地演示可以用 `127.0.0.1`。如果你在团队环境里跑，把 Hub URL 换成团队给你的地址；不要把真实内网域名、真实机器名或真实 IP 写进课程、文档和公开 issue。
+
+```bash
+export HUB_URL=http://127.0.0.1:9200
+anet init --hub "$HUB_URL"
+```
+
+登录用你当前环境的账号。课程里不写真实用户名和密码：
+
+```bash
+read -r ANET_USER
+read -rsp ANET_PASSWORD
+printf '\n'
+
+anet login --username "$ANET_USER" --password "$ANET_PASSWORD"
+```
+
+如果这个项目要放在单独 network 里，先切到对应 network：
+
+```bash
+anet network use course-demo
+```
+
+这里的关键不是 network 名字，而是边界意识：同一个 Hub 可以有多个 network；节点能看见谁、任务发给谁，取决于你当前的网络和 token。
+
+## 5. 创建四个节点
+
+在项目目录里创建节点：
+
+```bash
+anet node create reviewer-security
+anet node create reviewer-performance
+anet node create reviewer-style
+anet node create judge
+```
+
+确认配置确实写在当前项目：
+
+```bash
+find .anet/nodes -maxdepth 2 -type f -name config.json
+```
+
+你应该看到类似：
+
+```text
+.anet/nodes/reviewer-security/config.json
+.anet/nodes/reviewer-performance/config.json
+.anet/nodes/reviewer-style/config.json
+.anet/nodes/judge/config.json
+```
+
+这些配置里包含节点级 token。不要把 `.anet/` 提交进 Git，也不要把 token 截图发到 issue。
+
+## 6. 用 project 拉起整组节点
+
+四个节点可以逐个启动，但项目级启停更接近真实使用：
+
+```bash
+anet project up --stagger 1
+```
+
+`--stagger 1` 表示节点之间错峰 1 秒启动。本机演示可以用 0；团队环境里建议保留错峰，避免一瞬间打满 Hub、模型服务或机器资源。
+
+检查节点：
+
+```bash
+anet node ls
+```
+
+打开 Dashboard：
+
+```bash
+anet hub dashboard
+```
+
+浏览器打开：
+
+```text
+http://127.0.0.1:3000
+```
+
+在 Overview / Nodes 里确认四个 alias 都在线。这里不要急着派任务；先确认拓扑和节点状态。多 Agent 项目最常见的失败，不是 prompt 写差，而是根本有节点没连上。
+
+## 7. 准备一份可审查输入
+
+第一次跑不要拿巨大 PR。准备一份小 diff，让你能快速验证流程：
+
+```bash
+mkdir -p samples review-output
+git diff origin/main...HEAD > samples/change.diff
+```
+
+如果当前目录不是 Git 仓库，或者还没有基准分支，就先用你自己的小 patch 文件放到：
+
+```text
+samples/change.diff
+```
+
+不要把真实客户代码、内部域名、生产密钥放进演示 diff。需要脱敏时，保留结构，替换具体值。
+
+## 8. 先跑 reviewer，再跑 judge
+
+第一轮建议手动派任务，方便你看清楚链路。给三个 reviewer 的任务要尽量一致，只改审查视角。
+
+给 `reviewer-security`：
+
+```text
+请审查 samples/change.diff。只关注安全风险：凭据泄露、权限绕过、注入、危险网络请求、危险文件读写。按 Findings 格式输出。如果没有阻塞问题，明确写 No blocking issue found in this area.
+```
+
+给 `reviewer-performance`：
+
+```text
+请审查 samples/change.diff。只关注性能和资源风险：重复计算、阻塞 IO、N+1、无谓网络请求、大对象内存占用。按 Findings 格式输出。如果没有阻塞问题，明确写 No blocking issue found in this area.
+```
+
+给 `reviewer-style`：
+
+```text
+请审查 samples/change.diff。只关注可读性、命名、抽象层级、死代码和测试缺口。按 Findings 格式输出。如果没有阻塞问题，明确写 No blocking issue found in this area.
+```
+
+这三条可以通过 Dashboard 的节点 Chat 发，也可以在你已有的自动化脚本里通过 CommHub 工具派发。刚开始建议用 Dashboard，因为你能直观看到 Chat、Tasks、Messages 的状态变化。
+
+等三份结果都回来，再给 `judge`：
+
+```text
+请合并三份 reviewer 结果，去重后输出一份 final review markdown。决议只能是 LGTM、Comment、Request Changes 三选一。阻塞问题必须放在最前面；如果 reviewer 之间意见冲突，请写出冲突点和你采用的判断。
+```
+
+这就是最小可用的 end-to-end：输入 diff，三个并行视角，最终合并。
+
+## 9. 在 Dashboard 里追链路
+
+跑项目时按这个顺序看：
+
+| 面板 | 看什么 | 判断 |
+|---|---|---|
+| Overview | 四个节点是否在线 | 节点没在线，先别怪任务 |
+| Nodes | alias、runtime、状态 | 目标 alias 是否正确 |
+| Tasks | 每条任务的状态 | `delivered` / `acked` / `running` / `replied` 到哪一步 |
+| Messages | 原始消息和回复 | 是否发错 network、发错 alias、内容是否完整 |
+| Chat | 人工介入 | 纠偏、补上下文、收口 |
+
+如果 `reviewer-security` 一直没有回复，不要直接重跑全项目。先看它停在哪个状态：
+
+- 没有 `delivered`：Hub 或 network 可能不对。
+- 有 `delivered` 没有 `acked`：alias、节点在线状态、SSE 连接要查。
+- 已经 `running` 很久：模型、工具、上下文长度或节点日志要查。
+- `failed` / `expired`：打开 Messages 和节点日志，看失败原因。
+
+这就是 CH5 的 Dashboard 在真实项目里的价值：不是“看起来很热闹”，而是让你定位协作卡在哪一段。
+
+## 10. 处理第一次跑偏
+
+真实项目第一次跑偏很正常。常见跑偏有三类。
+
+第一类：reviewer 改代码，而不是审查。
+
+介入方式：
+
+```text
+请停止生成代码补丁。本轮只输出 review findings，不直接修改文件。每条 finding 必须包含 Evidence 和 Suggested fix。
+```
+
+第二类：reviewer 泛泛而谈，没有引用 diff 证据。
+
+介入方式：
+
+```text
+请重新输出。每条 finding 必须引用 diff 里的文件名或变更片段；没有证据的判断不要保留。
+```
+
+第三类：judge 把低优先级建议当阻塞项。
+
+介入方式：
+
+```text
+请重新判定决议。只有会导致安全、数据、构建、测试或明确行为回归的问题才能进入 Request Changes；可读性建议放入 Comment。
+```
+
+这些介入不需要重启整个 Hub。它们应该通过 Chat 或下一条任务精确补给对应 Agent。
+
+## 11. 把输出收口成可上线产物
+
+当 judge 给出最终结论后，把结果写进项目输出目录：
+
+```bash
+mkdir -p review-output
+```
+
+如果你的 Agent 已经返回了 markdown，可以保存为：
+
+```text
+review-output/final-review.md
+```
+
+上线前做四个检查：
+
+| 检查 | 标准 |
+|---|---|
+| 决议清楚 | LGTM / Comment / Request Changes 三选一 |
+| 证据充分 | 每个问题有文件、片段或明确上下文 |
+| 建议可执行 | 不是“优化一下”，而是能看出怎么改 |
+| 权限克制 | 没有自动发评论、自动合并、自动改生产配置 |
+
+如果你要把它贴到 PR，也建议先人工读一遍，再手动发布。第一版多 Agent 项目的目标是稳定地产生可审查产物，不是让 Agent 获得所有发布权限。
+
+## 12. 写架构取舍记录
+
+项目跑通后，补一个 `DECISIONS.md`。它比“今天跑通了”更有价值：
+
+```markdown
+# Decisions
+
+## 为什么拆成 3 reviewer + 1 judge
+
+安全、性能、可读性可以并行；judge 负责去重和最终决议。
+
+## 为什么不自动发 GitHub 评论
+
+第一版需要人工验收，避免错误评论进入真实 PR。
+
+## 为什么用 project up 管理节点
+
+四个节点已经超过手动启动的舒适区；project 命令能减少遗漏。
+
+## 下一步
+
+- 把 reviewer prompt 固化成模板。
+- 增加小 diff 测试集。
+- 决定是否接入 GitHub 评论发布，发布前保留人工确认。
+```
+
+这份记录会帮你区分“当时随手这么做”和“我们刻意做了这个取舍”。多 Agent 项目一旦进入团队协作，取舍记录会比单次运行日志更重要。
+
+## 13. 停止和清理
+
+本轮结束后，先停项目：
+
+```bash
+anet project down
+```
+
+如果只想停某个节点：
+
+```bash
+anet project down --only reviewer-style
+```
+
+不要直接删除 `.anet/` 当作日常停止方式。`.anet/` 里是节点配置和 token；删除它会让你下次无法用同一套节点继续跑。只有在演示环境彻底结束、确认没有复用需求时，才清理项目目录。
+
+## 14. 什么时候升级成自动化
+
+手动跑通以后，再考虑自动化。可以按三步升级：
+
+1. 把三条 reviewer 任务模板保存成文件。
+2. 写一个脚本读取 diff，依次派给三个 reviewer。
+3. 等三份回复到齐后，再派给 judge，并把结果写到 `review-output/final-review.md`。
+
+不要一开始就追求全自动。你需要先知道每个节点的输出是否稳定、Dashboard 里是否容易排查、失败时人工是否能介入。自动化应该固化一个已经清楚的流程，而不是掩盖一个还没想明白的流程。
+
+## 总结
+
+这一节用 PR 审查室跑完了一个完整多 Agent 项目：
+
+1. 先判断任务是否可拆、可并行、可验收、低风险。
+2. 用 README 写清输入、输出、角色和不做什么。
+3. 创建 `reviewer-security`、`reviewer-performance`、`reviewer-style`、`judge` 四个节点。
+4. 用 `anet project up` 拉起整组，用 Dashboard 看节点、任务、消息和人工介入入口。
+5. 第一次跑偏时，不重启全系统，而是按状态和上下文精确纠偏。
+6. 最终把结果收口成可审查 markdown，再决定是否进入真实 PR 流程。
+
+到这里，你已经走完了“从 0 搭项目、跑通、排查、上线”的闭环。下一节会把内置的 debate、socialmedia、pr-review、sci-team 四个 demo 拆开看：它们不是只能看热闹的样例，而是可以改造成你自己项目的脚手架。
